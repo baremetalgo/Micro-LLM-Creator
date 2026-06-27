@@ -1,0 +1,7 @@
+numpy
+torch
+tqdm
+PyPDF2
+nltk
+tokenizers
+PySide6
