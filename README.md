@@ -1,7 +1,7 @@
 <p3 align="center">Copyright @ Intelligent Network for Deliberation, Reasoning & Action (INDRA)</p>
 <p>contact - contact.nilesh.jadhav@gmail.com</p>
 
-# Micro LLM Trainer
+# Micro LLM Creator
 <p align="center">
   <img src="example.png" width="100%">
 </p>
