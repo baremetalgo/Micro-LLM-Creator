@@ -1,4 +1,7 @@
-# Micro Trainer
+<p3 align="center">Copyright @ Intelligent Network for Deliberation, Reasoning & Action (INDRA)</p>
+<p>contact - contact.nilesh.jadhav@gmail.com</p>
+
+# Micro LLM Trainer
 <p align="center">
   <img src="example.png" width="100%">
 </p>
