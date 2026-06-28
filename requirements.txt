@@ -5,3 +5,7 @@ PyPDF2
 nltk
 tokenizers
 PySide6
+pycryptodome
+llama-cpp-python
+markdown
+Pygments

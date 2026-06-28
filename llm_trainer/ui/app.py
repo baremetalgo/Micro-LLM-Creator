@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import ctypes
 from queue import Empty, Queue
+import re
 import sys
 from pathlib import Path
+from threading import Event
 from typing import Any, Optional, Union
+from urllib.parse import quote
 
 import torch
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
@@ -24,9 +27,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QSpinBox,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -34,7 +39,9 @@ from PySide6.QtWidgets import (
 
 from llm_trainer.config import DatasetConfig, ModelConfig, TrainingConfig
 from llm_trainer.export import export_project_bundle, quantize_checkpoint
+from llm_trainer.llama_chat import LlamaChatSession, load_llama_chat_session, stream_chat_reply
 from llm_trainer.services import build_dataset, train_from_dataset
+from llm_trainer.ui.chat_widgets import ChatInputEdit, ChatMessageWidget
 
 
 WINDOWS_APP_ID = "MicroLLMCreator.Lightning"
@@ -46,7 +53,14 @@ class TaskWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn: Any, *args: Any, progress_queue: Optional[Queue] = None, with_progress: bool = False) -> None:
+    def __init__(
+        self,
+        fn: Any,
+        *args: Any,
+        progress_queue: Optional[Queue] = None,
+        with_progress: bool = False,
+        stop_event: Optional[Event] = None,
+    ) -> None:
         """Create a worker.
 
         Args:
@@ -54,6 +68,7 @@ class TaskWorker(QObject):
             *args: Positional arguments passed to ``fn``.
             progress_queue: Optional queue for progress events.
             with_progress: Whether to pass a progress callback to ``fn``.
+            stop_event: Optional event used for cooperative cancellation.
         """
 
         super().__init__()
@@ -61,13 +76,14 @@ class TaskWorker(QObject):
         self.args = args
         self.progress_queue = progress_queue
         self.with_progress = with_progress
+        self.stop_event = stop_event
 
     def run(self) -> None:
         """Execute the worker function and emit completion or failure."""
 
         try:
             if self.with_progress:
-                self.finished.emit(self.fn(*self.args, progress=self._queue_progress))
+                self.finished.emit(self.fn(*self.args, progress=self._queue_progress, should_stop=self._should_stop))
             else:
                 self.finished.emit(self.fn(*self.args))
         except Exception as exc:
@@ -76,6 +92,11 @@ class TaskWorker(QObject):
     def _queue_progress(self, event: Any) -> None:
         if self.progress_queue is not None:
             self.progress_queue.put(event)
+
+    def _should_stop(self) -> bool:
+        """Return whether the task has been asked to stop."""
+
+        return bool(self.stop_event and self.stop_event.is_set())
 
 
 class MainWindow(QMainWindow):
@@ -86,19 +107,29 @@ class MainWindow(QMainWindow):
 
         super().__init__()
         if QApplication.instance():
-            QApplication.instance().setFont(QFont("Segoe UI", 10))
+            QApplication.instance().setFont(QFont("Arial", 10))
         self.setWindowTitle("Micro LLM Creator")
         self.setWindowIcon(self._lightning_icon())
         self._windows_icon_handles: list[int] = []
         self.resize(1240, 820)
         self.thread: Optional[QThread] = None
         self.worker: Optional[TaskWorker] = None
+        self.stop_event: Optional[Event] = None
         self.progress_queue: Optional[Queue] = None
         self.active_log: Optional[QTextEdit] = None
         self.active_progress_bar: Optional[QProgressBar] = None
         self.active_button: Optional[QPushButton] = None
+        self.active_stop_button: Optional[QPushButton] = None
         self.active_button_text = ""
         self.active_button_restore_text = ""
+        self.chat_session: Optional[LlamaChatSession] = None
+        self.chat_markdown = ""
+        self.chat_stream_prefix = ""
+        self.chat_stream_reply = ""
+        self.current_assistant_browser: Optional[QTextBrowser] = None
+        self.current_assistant_meta: Optional[QLabel] = None
+        self.current_assistant_message: Optional[ChatMessageWidget] = None
+        self.pending_user_message = ""
         self.spinner_index = 0
         self.spinner_timer = QTimer(self)
         self.spinner_timer.timeout.connect(self._tick_spinner)
@@ -111,97 +142,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(shell)
 
     def _apply_style(self) -> None:
-        """Apply the sci-fi dashboard stylesheet."""
+        """Load the application stylesheet from the QSS module file."""
 
-        self.setStyleSheet(
-            """
-            * { font-family: "Segoe UI", Arial, sans-serif; }
-            QMainWindow, QWidget#AppShell {
-                background: #050914;
-                color: #d6e2dd;
-            }
-            QWidget#TopBar {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #07162b, stop:1 #101633);
-                border-bottom: 1px solid #1d7ea3;
-            }
-            QWidget#SideRail {
-                background: #050d1d;
-                border-right: 1px solid #1d7ea3;
-            }
-            QWidget#RightPanel {
-                background: #081426;
-                border-left: 1px solid #1d7ea3;
-            }
-            QLabel#Logo {
-                color: #73f7ff;
-                font-size: 24px;
-                font-weight: 900;
-            }
-            QLabel#AppTitle {
-                color: #f5fff9;
-                font-size: 28px;
-                font-weight: 700;
-            }
-            QLabel#PageTitle {
-                color: #f5fff9;
-                font-size: 25px;
-                font-weight: 700;
-            }
-            QLabel#SectionLabel {
-                color: #73f7ff;
-                font-size: 12px;
-                font-weight: 800;
-                text-transform: uppercase;
-            }
-            QLabel#SideTitle {
-                color: #d8e7ff;
-                font-size: 18px;
-                font-weight: 800;
-            }
-            QWidget#Panel {
-                background: #071225;
-                color: #d6e2dd;
-            }
-            QWidget#Card {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0b1b34, stop:1 #101b3a);
-                border: 1px solid #235e80;
-                border-radius: 8px;
-            }
-            QPushButton#NavButton {
-                background: #071225; color: #a8c7e8; border: 1px solid #235e80;
-                border-radius: 8px; min-width: 42px; min-height: 42px; padding: 0;
-            }
-            QPushButton#NavButton:checked, QPushButton#NavButton:hover {
-                background: #73f7ff; color: #071225; border-color: #b8fbff;
-            }
-            QLabel { color: #c8d8f0; font-size: 13px; }
-            QLabel#Metric { color: #a4ff7a; font-size: 14px; font-weight: 700; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background: #050a12; color: #eff9ff; border: 1px solid #1d7ea3;
-                border-radius: 7px; padding: 8px 10px; min-height: 22px;
-            }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-                border-color: #73f7ff;
-                background: #07101f;
-            }
-            QCheckBox { color: #c8d8f0; spacing: 8px; }
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #73f7ff, stop:1 #49a7ff);
-                color: #03101d; border: 1px solid #b8fbff;
-                border-radius: 7px; padding: 9px 14px; font-weight: 800;
-            }
-            QPushButton:hover { background: #b8fbff; }
-            QTextEdit {
-                background: #03070d; color: #a8f1ff; border: 1px solid #1d7ea3;
-                border-radius: 8px; padding: 10px; font-family: Consolas, monospace; font-size: 12px;
-            }
-            QProgressBar {
-                background: #03070d; border: 0; border-radius: 2px;
-                min-height: 4px; max-height: 4px;
-            }
-            QProgressBar::chunk { background: #73f7ff; border-radius: 2px; }
-            """
-        )
+        qss_path = Path(__file__).with_name("styles.qss")
+        self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
     def _build_shell(self) -> QWidget:
         """Build the top-level dashboard shell.
@@ -226,11 +170,24 @@ class MainWindow(QMainWindow):
         self.search_box.setPlaceholderText("Search project...")
         self.search_box.setMaximumWidth(320)
         self._tip(self.search_box, "Search across project paths and future saved presets. This does not affect training.")
+        self.dataset_status = QLabel("Dataset: not prepared")
+        self.train_status = QLabel("Training: idle")
+        self.export_status = QLabel("Export: waiting")
+        self.chat_status = QLabel("Chat: no GGUF loaded")
+        for label in (self.dataset_status, self.train_status, self.export_status, self.chat_status):
+            label.setObjectName("TopStatus")
+            label.setMaximumWidth(230)
+            label.setWordWrap(False)
         self.project_state = QLabel("Ready")
         self.project_state.setObjectName("Metric")
         top_layout.addWidget(logo)
         top_layout.addSpacing(18)
         top_layout.addWidget(self.search_box)
+        top_layout.addSpacing(10)
+        top_layout.addWidget(self.dataset_status)
+        top_layout.addWidget(self.train_status)
+        top_layout.addWidget(self.export_status)
+        top_layout.addWidget(self.chat_status)
         top_layout.addStretch(1)
         top_layout.addWidget(self.project_state)
         root.addWidget(top)
@@ -247,26 +204,30 @@ class MainWindow(QMainWindow):
         self.dataset_nav = self._nav_button("IN")
         self.training_nav = self._nav_button("AI")
         self.export_nav = self._nav_button("X")
+        self.chat_nav = self._nav_button("Chat")
         self._tip(self.dataset_nav, "Open dataset preparation: load text/PDF files and build tokenizer data.")
         self._tip(self.training_nav, "Open model training: configure architecture and optimization settings.")
         self._tip(self.export_nav, "Open export tools: bundle or quantize the trained model artifacts.")
+        self._tip(self.chat_nav, "Open Chat: load a GGUF model once and send prompts.")
         self.dataset_nav.setChecked(True)
         self.dataset_nav.clicked.connect(lambda: self._switch_page(0))
         self.training_nav.clicked.connect(lambda: self._switch_page(1))
         self.export_nav.clicked.connect(lambda: self._switch_page(2))
+        self.chat_nav.clicked.connect(lambda: self._switch_page(3))
         rail_layout.addWidget(self.dataset_nav)
         rail_layout.addWidget(self.training_nav)
         rail_layout.addWidget(self.export_nav)
+        rail_layout.addWidget(self.chat_nav)
         rail_layout.addStretch(1)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_dataset_tab())
         self.pages.addWidget(self._build_training_tab())
         self.pages.addWidget(self._build_export_tab())
+        self.pages.addWidget(self._build_chat_tab())
 
         body.addWidget(rail)
         body.addWidget(self.pages, 1)
-        body.addWidget(self._build_status_panel())
         root.addLayout(body, 1)
         return shell
 
@@ -293,36 +254,9 @@ class MainWindow(QMainWindow):
         """
 
         self.pages.setCurrentIndex(index)
-        buttons = [self.dataset_nav, self.training_nav, self.export_nav]
+        buttons = [self.dataset_nav, self.training_nav, self.export_nav, self.chat_nav]
         for button_index, button in enumerate(buttons):
             button.setChecked(button_index == index)
-
-    def _build_status_panel(self) -> QWidget:
-        """Build the right-side project status panel.
-
-        Returns:
-            Status panel widget.
-        """
-
-        panel = QWidget()
-        panel.setObjectName("RightPanel")
-        panel.setFixedWidth(300)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(26, 26, 26, 26)
-        layout.setSpacing(18)
-        title = QLabel("Project Status")
-        title.setObjectName("SideTitle")
-        self.dataset_status = QLabel("Dataset: not prepared")
-        self.train_status = QLabel("Training: idle")
-        self.export_status = QLabel("Export: waiting")
-        for label in (self.dataset_status, self.train_status, self.export_status):
-            label.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(self.dataset_status)
-        layout.addWidget(self.train_status)
-        layout.addWidget(self.export_status)
-        layout.addStretch(1)
-        return panel
 
     def _build_dataset_tab(self) -> QWidget:
         """Build the dataset preparation page.
@@ -420,13 +354,22 @@ class MainWindow(QMainWindow):
         self._tip(self.prepare_button, "Read source files, clean text, train tokenizer, split tokens, and save the dataset project.")
         self.prepare_button.clicked.connect(self.prepare_dataset)
         self.prepare_button.setMaximumWidth(320)
+        self.stop_dataset_button = QPushButton("Stop")
+        self.stop_dataset_button.setEnabled(False)
+        self.stop_dataset_button.setMaximumWidth(120)
+        self.stop_dataset_button.clicked.connect(self.stop_active_task)
+        self._tip(self.stop_dataset_button, "Request a graceful stop for dataset preparation.")
 
         self.dataset_log = QTextEdit()
         self.dataset_log.setReadOnly(True)
         log_layout = QVBoxLayout()
         log_layout.addWidget(self.dataset_log)
         layout.addWidget(self._card("INGEST TELEMETRY", log_layout), 1)
-        layout.addWidget(self.prepare_button)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.prepare_button)
+        action_row.addWidget(self.stop_dataset_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
 
         self.dataset_progress = self._thin_progress()
         layout.addWidget(self.dataset_progress)
@@ -546,13 +489,22 @@ class MainWindow(QMainWindow):
         self._tip(self.train_button, "Start or resume training using the selected model and optimizer settings.")
         self.train_button.clicked.connect(self.start_training)
         self.train_button.setMaximumWidth(320)
+        self.stop_training_button = QPushButton("Stop")
+        self.stop_training_button.setEnabled(False)
+        self.stop_training_button.setMaximumWidth(120)
+        self.stop_training_button.clicked.connect(self.stop_active_task)
+        self._tip(self.stop_training_button, "Request a graceful stop and save a resumable checkpoint.")
 
         self.training_log = QTextEdit()
         self.training_log.setReadOnly(True)
         telemetry_layout = QVBoxLayout()
         telemetry_layout.addWidget(self.training_log)
         layout.addWidget(self._card("TRAINING TELEMETRY", telemetry_layout), 1)
-        layout.addWidget(self.train_button)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.train_button)
+        action_row.addWidget(self.stop_training_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
 
         self.training_progress = self._thin_progress()
         layout.addWidget(self.training_progress)
@@ -615,6 +567,143 @@ class MainWindow(QMainWindow):
 
         self.export_progress = self._thin_progress()
         layout.addWidget(self.export_progress)
+        return page
+
+    def _build_chat_tab(self) -> QWidget:
+        """Build the GGUF model test chat page.
+
+        Returns:
+            Chat page widget.
+        """
+
+        page = self._panel()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 20, 24, 14)
+        layout.setSpacing(12)
+
+        main = QHBoxLayout()
+        main.setSpacing(14)
+
+        chat_column = QVBoxLayout()
+        chat_column.setSpacing(10)
+
+        self.chat_scroll = QScrollArea()
+        self.chat_scroll.setObjectName("ChatScroll")
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setMinimumHeight(420)
+        self._tip(self.chat_scroll, "Rendered Markdown conversation view.")
+        self.chat_canvas = QWidget()
+        self.chat_canvas.setObjectName("ChatCanvas")
+        self.chat_messages = QVBoxLayout(self.chat_canvas)
+        self.chat_messages.setContentsMargins(14, 14, 14, 14)
+        self.chat_messages.setSpacing(12)
+        self.chat_messages.addStretch(1)
+        self.chat_scroll.setWidget(self.chat_canvas)
+        self.chat_event_log = QTextEdit()
+        self.chat_event_log.setVisible(False)
+        self._add_chat_message("assistant", "Load a GGUF model to start testing.")
+        self.chat_stats = QLabel("Idle")
+        self.chat_stats.setObjectName("Metric")
+        self.chat_stats.setVisible(False)
+        self._tip(self.chat_stats, "Generation timing, produced tokens, and approximate token speed.")
+        chat_column.addWidget(self.chat_scroll, 1)
+
+        prompt_row = QHBoxLayout()
+        prompt_row.setSpacing(10)
+        self.chat_input = ChatInputEdit()
+        self.chat_input.setObjectName("ChatInput")
+        self.chat_input.setMaximumHeight(92)
+        self.chat_input.setPlaceholderText("Send a message...")
+        self._tip(self.chat_input, "Prompt to send to the loaded model.")
+        self.chat_input.sendRequested.connect(self.send_chat_message)
+        self.send_chat_button = QPushButton("Send")
+        self.send_chat_button.setMaximumWidth(120)
+        self.send_chat_button.clicked.connect(self.send_chat_message)
+        self._tip(self.send_chat_button, "Send the message to the already loaded model.")
+        self.stop_chat_button = QPushButton("Stop")
+        self.stop_chat_button.setMaximumWidth(120)
+        self.stop_chat_button.setEnabled(False)
+        self.stop_chat_button.clicked.connect(self.stop_active_task)
+        self._tip(self.stop_chat_button, "Stop the current streamed reply.")
+        prompt_row.addWidget(self.chat_input, 1)
+        prompt_row.addWidget(self.send_chat_button)
+        prompt_row.addWidget(self.stop_chat_button)
+        chat_column.addLayout(prompt_row)
+
+        settings_column = QVBoxLayout()
+        settings_column.setSpacing(12)
+        settings_panel = QWidget()
+        settings_panel.setMaximumWidth(390)
+        settings_panel.setMinimumWidth(340)
+        settings_panel.setLayout(settings_column)
+
+        model_form = QFormLayout()
+        self._configure_form(model_form)
+        self.gguf_path = QLineEdit()
+        self._tip(self.gguf_path, "Path to a GGUF model file produced by llama.cpp-compatible export tooling.")
+        self.llama_context = self._spin(256, 131072, 2048)
+        self._tip(self.llama_context, "llama.cpp context window. Larger values allow longer chats but use more memory.")
+        self.llama_threads = self._spin(1, 128, 4)
+        self._tip(self.llama_threads, "CPU threads used by llama.cpp inference.")
+        self.llama_gpu_layers = self._spin(-1, 200, -1)
+        self._tip(self.llama_gpu_layers, "Number of transformer layers to offload to GPU. Use -1 to offload all possible layers.")
+        model_form.addRow("GGUF model", self._path_row(self.gguf_path, directory=False, file_filter="GGUF models (*.gguf);;All files (*)"))
+        model_form.addRow("Context", self.llama_context)
+        model_form.addRow("CPU threads", self.llama_threads)
+        model_form.addRow("GPU layers", self.llama_gpu_layers)
+        self.load_llm_button = QPushButton("Load Model")
+        self.load_llm_button.setMaximumWidth(180)
+        self.load_llm_button.clicked.connect(self.toggle_llm_model)
+        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+        self.reset_chat_button = QPushButton("Reset Chat")
+        self.reset_chat_button.setMaximumWidth(180)
+        self.reset_chat_button.clicked.connect(self.reset_chat)
+        self._tip(self.reset_chat_button, "Clear conversation memory while keeping the model loaded.")
+        loader_buttons = QHBoxLayout()
+        loader_buttons.addWidget(self.load_llm_button)
+        loader_buttons.addWidget(self.reset_chat_button)
+        loader_buttons.addStretch(1)
+        model_form.addRow("", loader_buttons)
+
+        sample_form = QFormLayout()
+        self._configure_form(sample_form)
+        self.reasoning_effort = QComboBox()
+        self.reasoning_effort.addItems(["Balanced", "Fast", "Deep"])
+        self.reasoning_effort.setMaximumWidth(260)
+        self._tip(self.reasoning_effort, "Controls the instruction style sent with each prompt. Deep asks for more careful reasoning.")
+        self.chat_max_tokens = self._spin(16, 8192, 512)
+        self._tip(self.chat_max_tokens, "Maximum new tokens for each assistant reply.")
+        self.chat_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
+        self._tip(self.chat_temperature, "Sampling randomness. Lower is more focused; higher is more creative.")
+        self.chat_top_p = self._double_spin(0.01, 1.0, 0.9, 0.01, 2)
+        self._tip(self.chat_top_p, "Nucleus sampling. Lower values restrict the model to more likely tokens.")
+        self.chat_repeat_penalty = self._double_spin(0.8, 2.0, 1.1, 0.01, 2)
+        self._tip(self.chat_repeat_penalty, "Penalty for repeated text. Higher can reduce loops.")
+        sample_form.addRow("Reasoning effort", self.reasoning_effort)
+        sample_form.addRow("Max tokens", self.chat_max_tokens)
+        sample_form.addRow("Temperature", self.chat_temperature)
+        sample_form.addRow("Top-p", self.chat_top_p)
+        sample_form.addRow("Repeat penalty", self.chat_repeat_penalty)
+
+        self.system_prompt = QTextEdit()
+        self.system_prompt.setObjectName("SystemPrompt")
+        self.system_prompt.setMaximumHeight(120)
+        self.system_prompt.setPlaceholderText("Optional system prompt")
+        self._tip(self.system_prompt, "Optional behavior instruction sent to the model with each message.")
+        system_layout = QVBoxLayout()
+        system_layout.addWidget(self.system_prompt)
+
+        settings_column.addWidget(self._card("MODEL LOADER", model_form))
+        settings_column.addWidget(self._card("RESPONSE TUNING", sample_form))
+        settings_column.addWidget(self._card("SYSTEM PROMPT", system_layout))
+        settings_column.addStretch(1)
+
+        main.addLayout(chat_column, 1)
+        main.addWidget(settings_panel)
+        layout.addLayout(main, 1)
+
+        self.chat_progress = self._thin_progress()
+        layout.addWidget(self.chat_progress)
         return page
 
     def _panel(self) -> QWidget:
@@ -704,12 +793,13 @@ class MainWindow(QMainWindow):
         spin.setMaximumWidth(260)
         return spin
 
-    def _path_row(self, field: QLineEdit, directory: bool = True) -> QWidget:
+    def _path_row(self, field: QLineEdit, directory: bool = True, file_filter: str = "Checkpoints (*.pt)") -> QWidget:
         """Create a path field with a browse button.
 
         Args:
             field: Path input widget.
             directory: Whether the browse dialog selects folders.
+            file_filter: File dialog filter used when ``directory`` is false.
 
         Returns:
             Row widget containing the path input and button.
@@ -725,7 +815,7 @@ class MainWindow(QMainWindow):
         self._tip(browse, "Open a file/folder picker for this path.")
         field.setMinimumWidth(260)
         field.setMaximumWidth(560)
-        browse.clicked.connect(lambda: self._browse(field, directory))
+        browse.clicked.connect(lambda: self._browse(field, directory, file_filter))
         layout.addWidget(field, 1)
         layout.addWidget(browse)
         return row
@@ -769,6 +859,504 @@ class MainWindow(QMainWindow):
         widget.setToolTip(text)
         widget.setStatusTip(text)
 
+    def _render_chat_markdown(self, markdown_text: str) -> None:
+        """Render chat Markdown with highlighted fenced code blocks when possible.
+
+        Args:
+            markdown_text: Markdown transcript to render.
+        """
+
+        if not hasattr(self, "current_assistant_message") or self.current_assistant_message is None:
+            return
+        self.current_assistant_message.set_content(markdown_text)
+
+    def _markdown_to_html(self, markdown_text: str) -> str:
+        """Convert Markdown to themed HTML.
+
+        Args:
+            markdown_text: Markdown content.
+
+        Returns:
+            HTML suitable for a chat bubble.
+        """
+
+        try:
+            import markdown as markdown_lib
+            from pygments import highlight
+            from pygments.formatters import HtmlFormatter
+            from pygments.lexers import TextLexer, get_lexer_by_name, guess_lexer
+
+            markdown_text = self._normalize_code_blocks(markdown_text)
+            body_parts: list[str] = []
+            pattern = re.compile(r"```(?P<lang>[\w+-]*)\n(?P<code>.*?)```", re.DOTALL)
+            last = 0
+            formatter = HtmlFormatter(style="monokai", noclasses=True, nowrap=True)
+            for match in pattern.finditer(markdown_text):
+                prose = markdown_text[last:match.start()]
+                if prose.strip():
+                    body_parts.append(markdown_lib.markdown(prose, extensions=["tables", "nl2br"]))
+                code = match.group("code")
+                lang = match.group("lang").strip()
+                try:
+                    lexer = get_lexer_by_name(lang) if lang else guess_lexer(code)
+                except Exception:
+                    lexer = TextLexer()
+                highlighted = highlight(code, lexer, formatter)
+                label = lang.title() if lang else lexer.name
+                body_parts.append(self._code_block_html(label, highlighted, code))
+                last = match.end()
+            prose = markdown_text[last:]
+            if prose.strip():
+                body_parts.append(markdown_lib.markdown(prose, extensions=["tables", "nl2br"]))
+            body = "\n".join(body_parts) if body_parts else ""
+            return (
+                f"""<!doctype html>
+                <html>
+                <head>
+                <style>
+                body {{
+                    background: transparent;
+                    color: #eeeeee;
+                    font-family: Arial, "Segoe UI", sans-serif;
+                    font-size: 14px;
+                    line-height: 1.22;
+                    margin: 0;
+                }}
+                h1 {{ color: #f2f2f2; font-size: 19px; margin: 6px 0 3px 0; }}
+                h2 {{ color: #f2f2f2; font-size: 17px; margin: 6px 0 3px 0; }}
+                h3 {{ color: #f2f2f2; font-size: 15px; margin: 5px 0 2px 0; }}
+                p {{ margin: 2px 0; }}
+                ol, ul {{ margin-top: 2px; margin-bottom: 2px; padding-left: 20px; }}
+                li {{ margin: 1px 0; }}
+                code {{
+                    background: #1a1a1a;
+                    color: #d4d4d4;
+                    border-radius: 4px;
+                    padding: 2px 4px;
+                    font-family: Consolas, monospace;
+                }}
+                pre {{
+                    background: transparent;
+                    border: 0;
+                    border-radius: 0;
+                    padding: 0;
+                    margin: 4px 0;
+                    overflow: auto;
+                    white-space: pre-wrap;
+                }}
+                pre code {{
+                    background: transparent;
+                    padding: 0;
+                    color: #d4d4d4;
+                    font-family: Consolas, monospace;
+                    font-size: 13px;
+                    line-height: 1.16;
+                }}
+                blockquote {{
+                    border-left: 3px solid #f5b041;
+                    margin-left: 0;
+                    padding-left: 12px;
+                    color: #cccccc;
+                }}
+                table {{ border-collapse: collapse; }}
+                th, td {{ border: 1px solid #555555; padding: 6px 8px; }}
+                .codeblock {{
+                    background: #050505;
+                    border: 1px solid #2b2b2b;
+                    border-radius: 12px;
+                    margin: 8px 0;
+                }}
+                .codebar {{
+                    color: #f2f2f2;
+                    background: #111111;
+                    border-bottom: 1px solid #2b2b2b;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                    font-weight: bold;
+                }}
+                .copylink {{
+                    color: #d7d7d7;
+                    text-decoration: none;
+                    float: right;
+                    font-weight: normal;
+                }}
+                .codebody {{ padding: 12px 14px; }}
+                </style>
+                </head>
+                <body>{body}</body>
+                </html>
+                """
+            )
+        except Exception:
+            return self._basic_markdown_html(markdown_text)
+
+    def _basic_markdown_html(self, markdown_text: str) -> str:
+        """Render basic Markdown with simple code coloring.
+
+        Args:
+            markdown_text: Raw Markdown.
+
+        Returns:
+            Basic HTML.
+        """
+
+        text = self._normalize_code_blocks(markdown_text)
+        parts: list[str] = []
+        pattern = re.compile(r"```(?:\w+)?\n(.*?)```", re.DOTALL)
+        last = 0
+        for match in pattern.finditer(text):
+            parts.append(self._render_basic_prose(text[last:match.start()]))
+            code = match.group(1)
+            parts.append(self._code_block_html("Code", self._colorize_code(code), code))
+            last = match.end()
+        parts.append(self._render_basic_prose(text[last:]))
+        return (
+            "<html><body style='background:transparent;color:#eeeeee;font-family:Arial;font-size:14px;line-height:1.22;'>"
+            "<style>"
+            "p{margin:2px 0;} h1{font-size:19px;margin:6px 0 3px;} h2{font-size:17px;margin:6px 0 3px;}"
+            "h3{font-size:15px;margin:5px 0 2px;} ol,ul{margin-top:2px;margin-bottom:2px;padding-left:20px;} li{margin:1px 0;}"
+            "code{background:#1a1a1a;color:#d4d4d4;border-radius:4px;padding:2px 4px;font-family:Consolas,monospace;}"
+            "pre{background:transparent;border:0;border-radius:0;padding:0;margin:4px 0;"
+            "font-family:Consolas,monospace;white-space:pre-wrap;line-height:1.16;font-size:13px;}"
+            ".codeblock{background:#050505;border:1px solid #2b2b2b;border-radius:12px;margin:8px 0;}"
+            ".codebar{color:#f2f2f2;background:#111;border-bottom:1px solid #2b2b2b;padding:7px 10px;font-size:12px;font-weight:bold;}"
+            ".copylink{color:#d7d7d7;text-decoration:none;float:right;font-weight:normal;}.codebody{padding:12px 14px;}"
+            "</style>"
+            + "".join(parts)
+            + "</body></html>"
+        )
+
+    def _code_block_html(self, label: str, highlighted_html: str, raw_code: str) -> str:
+        """Build a code panel with a copy link.
+
+        Args:
+            label: Code language label.
+            highlighted_html: Highlighted code HTML.
+            raw_code: Raw code for clipboard copy.
+
+        Returns:
+            Code panel HTML.
+        """
+
+        return (
+            "<div class='codeblock'>"
+            f"<div class='codebar'>{self._escape_html(label or 'Code')}"
+            f"<a class='copylink' href='copycode:{quote(raw_code)}'>⧉ Copy</a></div>"
+            f"<div class='codebody'><pre><code>{highlighted_html}</code></pre></div>"
+            "</div>"
+        )
+
+    def _render_basic_prose(self, text: str) -> str:
+        """Render a small Markdown subset for fallback mode.
+
+        Args:
+            text: Markdown prose.
+
+        Returns:
+            HTML fragment.
+        """
+
+        html_lines: list[str] = []
+        in_ordered = False
+        in_unordered = False
+
+        def close_lists() -> None:
+            nonlocal in_ordered, in_unordered
+            if in_ordered:
+                html_lines.append("</ol>")
+                in_ordered = False
+            if in_unordered:
+                html_lines.append("</ul>")
+                in_unordered = False
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                close_lists()
+                html_lines.append("<br>")
+                continue
+            if line.startswith("### "):
+                close_lists()
+                html_lines.append(f"<h3>{self._inline_basic_markdown(line[4:])}</h3>")
+                continue
+            if line.startswith("## "):
+                close_lists()
+                html_lines.append(f"<h2>{self._inline_basic_markdown(line[3:])}</h2>")
+                continue
+            if line.startswith("# "):
+                close_lists()
+                html_lines.append(f"<h1>{self._inline_basic_markdown(line[2:])}</h1>")
+                continue
+            ordered = re.match(r"^\d+\.\s+(.*)$", line)
+            if ordered:
+                if not in_ordered:
+                    close_lists()
+                    html_lines.append("<ol>")
+                    in_ordered = True
+                html_lines.append(f"<li>{self._inline_basic_markdown(ordered.group(1))}</li>")
+                continue
+            unordered = re.match(r"^[-*]\s+(.*)$", line)
+            if unordered:
+                if not in_unordered:
+                    close_lists()
+                    html_lines.append("<ul>")
+                    in_unordered = True
+                html_lines.append(f"<li>{self._inline_basic_markdown(unordered.group(1))}</li>")
+                continue
+            close_lists()
+            html_lines.append(f"<p>{self._inline_basic_markdown(line)}</p>")
+        close_lists()
+        return "\n".join(html_lines)
+
+    def _inline_basic_markdown(self, text: str) -> str:
+        """Render inline Markdown for fallback mode.
+
+        Args:
+            text: Inline Markdown text.
+
+        Returns:
+            HTML fragment.
+        """
+
+        escaped = self._escape_html(text)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"\*(.+?)\*", r"<em>\1</em>", escaped)
+        return escaped
+
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        """Escape text for HTML.
+
+        Args:
+            text: Raw text.
+
+        Returns:
+            Escaped text.
+        """
+
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _colorize_code(self, code: str) -> str:
+        """Apply simple inline colors to Python-like code.
+
+        Args:
+            code: Source code.
+
+        Returns:
+            HTML code.
+        """
+
+        escaped = self._escape_html(code)
+        keywords = {
+            "def", "class", "import", "from", "for", "while", "if", "else", "elif",
+            "try", "except", "return", "print", "with", "as", "in", "function", "const",
+            "let", "var", "new", "typeof", "await", "async", "true", "false", "null",
+            "True", "False", "None",
+        }
+        builtins = {"console", "Object", "process", "JSON", "Array", "String", "Number", "Boolean", "Math", "os", "sys"}
+        token_pattern = re.compile(
+            r"(?P<comment>//.*|#.*)"
+            r"|(?P<string>`(?:\\.|[^`])*`|'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")"
+            r"|(?P<number>\b\d+(?:\.\d+)?\b)"
+            r"|(?P<word>\b[A-Za-z_][A-Za-z0-9_]*\b)"
+        )
+        colored_lines: list[str] = []
+        for line in escaped.splitlines():
+            segments: list[str] = []
+            last = 0
+            for match in token_pattern.finditer(line):
+                segments.append(line[last:match.start()])
+                value = match.group(0)
+                if match.lastgroup == "comment":
+                    segments.append(f"<span style='color:#6a9955;'>{value}</span>")
+                elif match.lastgroup == "string":
+                    segments.append(f"<span style='color:#ce9178;'>{value}</span>")
+                elif match.lastgroup == "number":
+                    segments.append(f"<span style='color:#b5cea8;'>{value}</span>")
+                elif match.lastgroup == "word":
+                    next_chars = line[match.end(): match.end() + 2]
+                    previous = line[max(0, match.start() - 1): match.start()]
+                    if value in keywords:
+                        segments.append(f"<span style='color:#569cd6;font-weight:bold;'>{value}</span>")
+                    elif value in builtins:
+                        segments.append(f"<span style='color:#4ec9b0;'>{value}</span>")
+                    elif next_chars.startswith("(") and previous != ".":
+                        segments.append(f"<span style='color:#dcdcaa;'>{value}</span>")
+                    elif previous == ".":
+                        segments.append(f"<span style='color:#9cdcfe;'>{value}</span>")
+                    else:
+                        segments.append(value)
+                last = match.end()
+            segments.append(line[last:])
+            colored_lines.append("".join(segments))
+        return "\n".join(colored_lines)
+
+    def _normalize_code_blocks(self, markdown_text: str) -> str:
+        """Fence obvious loose code blocks so syntax highlighting can run.
+
+        Args:
+            markdown_text: Raw model Markdown.
+
+        Returns:
+            Markdown with likely code blocks fenced.
+        """
+
+        if "```" in markdown_text:
+            if markdown_text.count("```") % 2:
+                return f"{markdown_text}\n```"
+            return markdown_text
+        lines = markdown_text.splitlines()
+        normalized: list[str] = []
+        code_block: list[str] = []
+
+        def is_code_line(line: str) -> bool:
+            stripped = line.strip()
+            if not stripped:
+                return bool(code_block)
+            if line.startswith(("    ", "\t")):
+                return True
+            if re.match(
+                r"^(def|class|import|from|for|while|if|else:?|elif|try:?|except|return|print|with|"
+                r"function|const|let|var|console\.|Object\.|process\.)\b",
+                stripped,
+            ):
+                return True
+            if stripped in {"{", "}", "};", "})", "});"}:
+                return True
+            if stripped.startswith(("#", "@")):
+                return True
+            return sum(stripped.count(symbol) for symbol in "()[]{}:=<>+-*/") >= 3
+
+        def flush() -> None:
+            nonlocal code_block
+            if len([line for line in code_block if line.strip()]) >= 3:
+                normalized.append(f"```{self._guess_code_language(code_block)}")
+                normalized.extend(code_block)
+                normalized.append("```")
+            else:
+                normalized.extend(code_block)
+            code_block = []
+
+        for line in lines:
+            if is_code_line(line):
+                code_block.append(line)
+            else:
+                flush()
+                normalized.append(line)
+        flush()
+        return "\n".join(normalized)
+
+    @staticmethod
+    def _guess_code_language(lines: list[str]) -> str:
+        """Guess a fence language for loose code.
+
+        Args:
+            lines: Code lines.
+
+        Returns:
+            Markdown fence language.
+        """
+
+        joined = "\n".join(lines).lower()
+        if any(marker in joined for marker in ("console.", "const ", "let ", "function ", "process.env", "object.keys")):
+            return "javascript"
+        if any(marker in joined for marker in ("#include", "std::", "cout", "cin")):
+            return "cpp"
+        if any(marker in joined for marker in ("public class", "system.out", "private ", "protected ")):
+            return "java"
+        if any(marker in joined for marker in ("def ", "import ", "print(", "self.")):
+            return "python"
+        return "text"
+
+    def _add_chat_message(
+        self,
+        role: str,
+        content: str,
+        metrics: str = "",
+        resend_prompt: Optional[str] = None,
+    ) -> QTextBrowser:
+        """Add one chat bubble.
+
+        Args:
+            role: Message role, either ``user`` or ``assistant``.
+            content: Markdown message content.
+            metrics: Optional metric text shown under assistant replies.
+            resend_prompt: Prompt to resend from the bubble.
+
+        Returns:
+            Text browser used by the bubble.
+        """
+
+        should_follow = self._is_chat_near_bottom()
+        max_width = max(320, int(self.chat_scroll.viewport().width() * 0.78)) if hasattr(self, "chat_scroll") else 900
+        message = ChatMessageWidget(
+            role,
+            content,
+            self._markdown_to_html,
+            self._resend_chat_message,
+            metrics=metrics,
+            resend_prompt=resend_prompt,
+            max_width=max_width,
+        )
+        self.chat_messages.insertWidget(max(self.chat_messages.count() - 1, 0), message)
+        if should_follow:
+            message.scroll_later(lambda: self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum()))
+        if role == "assistant":
+            self.current_assistant_message = message
+            self.current_assistant_browser = message.browser
+            self.current_assistant_meta = message.meta_label
+        return message.browser
+
+    def _is_chat_near_bottom(self) -> bool:
+        """Return whether the chat scroll is close enough to follow streaming.
+
+        Returns:
+            True when the view should auto-scroll.
+        """
+
+        if not hasattr(self, "chat_scroll"):
+            return True
+        bar = self.chat_scroll.verticalScrollBar()
+        return bar.maximum() - bar.value() < 48
+
+    def _clear_chat_messages(self) -> None:
+        """Remove all message bubbles."""
+
+        while self.chat_messages.count() > 1:
+            item = self.chat_messages.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.current_assistant_message = None
+        self.current_assistant_browser = None
+        self.current_assistant_meta = None
+
+    def _resend_chat_message(self, prompt: str) -> None:
+        """Resend text from a message bubble.
+
+        Args:
+            prompt: Prompt text to send.
+        """
+
+        self.chat_input.setPlainText(prompt)
+        self.send_chat_message()
+
+    def _set_chat_stats(self, elapsed_seconds: float, token_count: int, tokens_per_second: float) -> None:
+        """Update live chat generation metrics.
+
+        Args:
+            elapsed_seconds: Elapsed generation time.
+            token_count: Generated token count.
+            tokens_per_second: Approximate token speed.
+        """
+
+        text = f"Time: {elapsed_seconds:.2f}s  |  Tokens: {token_count:,}  |  Speed: {tokens_per_second:.2f} tok/s"
+        self.chat_stats.setText(text)
+        if self.current_assistant_meta is not None:
+            self.current_assistant_meta.setText(text)
+            self.current_assistant_meta.setVisible(True)
+
     def _lightning_icon(self) -> QIcon:
         """Create the window lightning icon.
 
@@ -791,8 +1379,8 @@ class MainWindow(QMainWindow):
         painter = QPainter(pixmap)
         try:
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.setBrush(QBrush(QColor("#071225")))
-            painter.setPen(QPen(QColor("#73f7ff"), 3))
+            painter.setBrush(QBrush(QColor("#1f1f1f")))
+            painter.setPen(QPen(QColor("#f5b041"), 3))
             painter.drawRoundedRect(4, 4, 56, 56, 12, 12)
             bolt = QPolygon([
                 QPoint(36, 8),
@@ -802,8 +1390,8 @@ class MainWindow(QMainWindow):
                 QPoint(48, 25),
                 QPoint(33, 25),
             ])
-            painter.setPen(QPen(QColor("#f7ff7a"), 2))
-            painter.setBrush(QBrush(QColor("#73f7ff")))
+            painter.setPen(QPen(QColor("#ffd27a"), 2))
+            painter.setBrush(QBrush(QColor("#f5b041")))
             painter.drawPolygon(bolt)
         finally:
             painter.end()
@@ -867,18 +1455,19 @@ class MainWindow(QMainWindow):
             user32.SendMessageW(hwnd, wm_seticon, icon_small, hicon_small)
             self._windows_icon_handles.append(hicon_small)
 
-    def _browse(self, field: QLineEdit, directory: bool) -> None:
+    def _browse(self, field: QLineEdit, directory: bool, file_filter: str = "Checkpoints (*.pt)") -> None:
         """Open a file or folder picker for a path field.
 
         Args:
             field: Path input to update.
             directory: Whether to select a folder instead of a file.
+            file_filter: File dialog filter used for files.
         """
 
         if directory:
             value = QFileDialog.getExistingDirectory(self, "Choose folder", field.text() or str(Path.cwd()))
         else:
-            value, _ = QFileDialog.getOpenFileName(self, "Choose checkpoint", field.text() or str(Path.cwd()), "Checkpoints (*.pt)")
+            value, _ = QFileDialog.getOpenFileName(self, "Choose file", field.text() or str(Path.cwd()), file_filter)
         if value:
             field.setText(value)
 
@@ -891,6 +1480,7 @@ class MainWindow(QMainWindow):
         progress_bar: QProgressBar,
         with_progress: bool = False,
         button: Optional[QPushButton] = None,
+        stop_button: Optional[QPushButton] = None,
         busy_text: str = "Working",
     ) -> None:
         """Run a long task on a background thread.
@@ -903,6 +1493,7 @@ class MainWindow(QMainWindow):
             progress_bar: Progress bar receiving percent updates.
             with_progress: Whether to pass a progress callback to the task.
             button: Optional button to disable while running.
+            stop_button: Optional stop button to enable while running.
             busy_text: Button text shown while running.
         """
 
@@ -912,12 +1503,22 @@ class MainWindow(QMainWindow):
 
         if button:
             self._set_button_busy(button, busy_text)
+        if stop_button:
+            stop_button.setEnabled(True)
+            self.active_stop_button = stop_button
 
+        self.stop_event = Event()
         self.progress_queue = Queue()
         self.active_log = log
         self.active_progress_bar = progress_bar
         self.thread = QThread(self)
-        self.worker = TaskWorker(fn, *args, progress_queue=self.progress_queue, with_progress=with_progress)
+        self.worker = TaskWorker(
+            fn,
+            *args,
+            progress_queue=self.progress_queue,
+            with_progress=with_progress,
+            stop_event=self.stop_event,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(on_finished)
@@ -931,6 +1532,17 @@ class MainWindow(QMainWindow):
         self.progress_timer.start(100)
         self.thread.start()
 
+    def stop_active_task(self) -> None:
+        """Request a graceful stop for the active background task."""
+
+        if self.stop_event is None:
+            return
+        self.stop_event.set()
+        if self.active_log is not None:
+            self.active_log.append("Stop requested. Finishing the current safe point...")
+        if self.active_stop_button is not None:
+            self.active_stop_button.setEnabled(False)
+
     def _handle_progress(self, event: object, log: QTextEdit, progress_bar: QProgressBar) -> None:
         """Apply one progress event to UI widgets.
 
@@ -941,6 +1553,9 @@ class MainWindow(QMainWindow):
         """
 
         if isinstance(event, dict):
+            if event.get("type") == "chat_delta":
+                self._apply_chat_delta(event)
+                return
             message = event.get("message")
             percent = event.get("percent")
             if message:
@@ -949,6 +1564,24 @@ class MainWindow(QMainWindow):
                 progress_bar.setValue(max(0, min(100, int(percent))))
         else:
             log.append(str(event))
+
+    def _apply_chat_delta(self, event: dict[str, Any]) -> None:
+        """Apply one streamed chat chunk to the rendered conversation.
+
+        Args:
+            event: Chat stream progress event.
+        """
+
+        self.chat_stream_reply += str(event.get("content", ""))
+        should_follow = self._is_chat_near_bottom()
+        self._render_chat_markdown(self.chat_stream_reply)
+        if should_follow:
+            self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum())
+        self._set_chat_stats(
+            float(event.get("elapsed_seconds", 0.0)),
+            int(event.get("token_count", 0)),
+            float(event.get("tokens_per_second", 0.0)),
+        )
 
     def _drain_progress_queue(self) -> None:
         """Drain queued worker progress events on the UI thread."""
@@ -977,9 +1610,11 @@ class MainWindow(QMainWindow):
         self.progress_timer.stop()
         self.thread = None
         self.worker = None
+        self.stop_event = None
         self.progress_queue = None
         self.active_log = None
         self.active_progress_bar = None
+        self.active_stop_button = None
 
     def _task_failed(self, message: str, log: QTextEdit, progress_bar: QProgressBar) -> None:
         """Handle background task failure.
@@ -991,7 +1626,10 @@ class MainWindow(QMainWindow):
         """
 
         log.append(f"Error: {message}")
+        progress_bar.setRange(0, 100)
         progress_bar.setValue(0)
+        if "stopped by user" in message.lower():
+            self.project_state.setText("Stopped")
         self._clear_button_busy()
 
     def _set_button_busy(self, button: QPushButton, text: str) -> None:
@@ -1021,6 +1659,8 @@ class MainWindow(QMainWindow):
         if self.active_button:
             self.active_button.setEnabled(True)
             self.active_button.setText(final_text or self.active_button_restore_text)
+        if self.active_stop_button:
+            self.active_stop_button.setEnabled(False)
         self.active_button = None
         self.active_button_text = ""
         self.active_button_restore_text = ""
@@ -1067,6 +1707,7 @@ class MainWindow(QMainWindow):
             self.dataset_progress,
             with_progress=True,
             button=self.prepare_button,
+            stop_button=self.stop_dataset_button,
             busy_text="Preparing Dataset",
         )
 
@@ -1136,6 +1777,7 @@ class MainWindow(QMainWindow):
             self.training_progress,
             with_progress=True,
             button=self.train_button,
+            stop_button=self.stop_training_button,
             busy_text="Training",
         )
 
@@ -1152,9 +1794,174 @@ class MainWindow(QMainWindow):
         if result.final_val_loss is not None:
             self.training_log.append(f"Final validation loss: {result.final_val_loss:.4f}")
         self.export_model_dir.setText(str(Path(self.model_dir.text())))
-        self.project_state.setText("Training complete")
-        self.train_status.setText(f"Training: loss {result.final_train_loss:.4f}")
+        if getattr(result, "stopped", False):
+            self.project_state.setText("Training stopped")
+            self.train_status.setText("Training: stopped, checkpoint saved")
+            self.training_log.append("Training stopped safely. Resume from this checkpoint or the latest checkpoint.")
+        else:
+            self.project_state.setText("Training complete")
+            self.train_status.setText(f"Training: loss {result.final_train_loss:.4f}")
         self._clear_button_busy("Start Training")
+
+    def toggle_llm_model(self) -> None:
+        """Load or unload the GGUF model depending on current state."""
+
+        if self.chat_session is not None:
+            self.unload_llm_model()
+            return
+        self.load_llm_model()
+
+    def load_llm_model(self) -> None:
+        """Load a GGUF model for chat testing."""
+
+        model_path = Path(self.gguf_path.text().strip())
+        if not model_path:
+            QMessageBox.information(self, "Model required", "Choose a GGUF model file first.")
+            return
+        self.chat_progress.setValue(0)
+        self._render_chat_markdown("**Loading GGUF model...**")
+        self.chat_stats.setText("Loading model...")
+        self.project_state.setText("Loading GGUF")
+        self.chat_status.setText("Chat: loading model")
+        self._run_task(
+            load_llama_chat_session,
+            (model_path, self.llama_context.value(), self.llama_threads.value(), self.llama_gpu_layers.value()),
+            self._llm_loaded,
+            self.chat_event_log,
+            self.chat_progress,
+            button=self.load_llm_button,
+            busy_text="Loading Model",
+        )
+
+    def _llm_loaded(self, session: Any) -> None:
+        """Store a loaded GGUF chat session.
+
+        Args:
+            session: Loaded ``LlamaChatSession``.
+        """
+
+        self.chat_session = session
+        self._clear_chat_messages()
+        self.chat_markdown = ""
+        self._add_chat_message(
+            "assistant",
+            f"Loaded model: `{session.model_path.name}`\n\n{session.runtime_summary}\n\nSend a message to begin.",
+        )
+        self.chat_progress.setValue(100)
+        self.chat_stats.setText(session.runtime_summary)
+        self.project_state.setText("GGUF loaded")
+        self.chat_status.setText(f"Chat: {session.runtime_summary}")
+        self._clear_button_busy("Unload")
+        self._tip(self.load_llm_button, "Unload the currently loaded GGUF model from memory.")
+
+    def unload_llm_model(self) -> None:
+        """Unload the active GGUF model and clear chat state."""
+
+        if self.thread is not None:
+            QMessageBox.information(self, "Task running", "Please wait for the current task to finish.")
+            return
+        if self.chat_session is not None and hasattr(self.chat_session, "reset"):
+            self.chat_session.reset()
+        self.chat_session = None
+        self._clear_chat_messages()
+        self.chat_markdown = ""
+        self._add_chat_message("assistant", "Model unloaded.\n\nLoad a GGUF model to start testing.")
+        self.chat_progress.setRange(0, 100)
+        self.chat_progress.setValue(0)
+        self.chat_stats.setText("Idle")
+        self.project_state.setText("Ready")
+        self.chat_status.setText("Chat: no GGUF loaded")
+        self.load_llm_button.setText("Load Model")
+        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+
+    def send_chat_message(self) -> None:
+        """Send a prompt to the loaded GGUF model."""
+
+        if self.chat_session is None:
+            QMessageBox.information(self, "Load model", "Load a GGUF model before sending a message.")
+            return
+        prompt = self.chat_input.toPlainText().strip()
+        if not prompt:
+            return
+        self.pending_user_message = prompt
+        self.chat_input.clear()
+        self._add_chat_message("user", prompt, resend_prompt=prompt)
+        self.chat_stream_reply = ""
+        self._add_chat_message("assistant", "_Thinking..._", resend_prompt=prompt)
+        self.chat_progress.setRange(0, 0)
+        self.chat_stats.setText("Thinking...")
+        self.project_state.setText("Generating")
+        self.chat_status.setText("Chat: generating reply")
+        self._run_task(
+            stream_chat_reply,
+            (
+                self.chat_session,
+                prompt,
+                self.system_prompt.toPlainText(),
+                self.chat_max_tokens.value(),
+                self.chat_temperature.value(),
+                self.chat_top_p.value(),
+                self.chat_repeat_penalty.value(),
+                self.reasoning_effort.currentText(),
+            ),
+            self._chat_reply_finished,
+            self.chat_event_log,
+            self.chat_progress,
+            with_progress=True,
+            button=self.send_chat_button,
+            stop_button=self.stop_chat_button,
+            busy_text="Thinking",
+        )
+
+    def _chat_reply_finished(self, reply: Any) -> None:
+        """Render the model reply.
+
+        Args:
+            reply: Assistant reply text and metrics.
+        """
+
+        result = reply if isinstance(reply, dict) else {"reply": str(reply)}
+        text = str(result.get("reply", "")).strip()
+        if text:
+            self.chat_stream_reply = text
+        else:
+            self.chat_stream_reply = self.chat_stream_reply or "_No reply returned._"
+        self._render_chat_markdown(self.chat_stream_reply)
+        self.chat_progress.setRange(0, 100)
+        self.chat_progress.setValue(100)
+        self._set_chat_stats(
+            float(result.get("elapsed_seconds", 0.0)),
+            int(result.get("token_count", 0)),
+            float(result.get("tokens_per_second", 0.0)),
+        )
+        self.project_state.setText("Ready")
+        self.chat_status.setText("Chat: ready")
+        self._clear_button_busy("Send")
+
+    def reset_chat(self) -> None:
+        """Clear the chat transcript and model conversation memory."""
+
+        if self.chat_session is not None:
+            self.chat_session.reset()
+        self._clear_chat_messages()
+        self.chat_markdown = ""
+        self.chat_stream_prefix = ""
+        self.chat_stream_reply = ""
+        self._add_chat_message("assistant", "Chat reset.")
+        self.chat_stats.setText("Idle")
+        self.chat_status.setText("Chat: ready")
+
+    def _append_chat_markdown(self, role: str, content: str) -> None:
+        """Append one rendered chat message.
+
+        Args:
+            role: Display role heading.
+            content: Markdown content.
+        """
+
+        block = f"### {role}\n{content.strip()}\n"
+        self.chat_markdown = f"{self.chat_markdown.rstrip()}\n\n{block}" if self.chat_markdown else block
+        self._add_chat_message("user" if role.lower() in {"you", "user"} else "assistant", content)
 
     def create_bundle(self) -> None:
         """Create a portable model export bundle."""
@@ -1218,7 +2025,7 @@ def main() -> None:
         except Exception:
             pass
     app = QApplication(sys.argv)
-    app.setFont(QFont("Segoe UI", 10))
+    app.setFont(QFont("Arial", 10))
     app.setWindowIcon(MainWindow._static_lightning_icon())
     window = MainWindow()
     window.show()
@@ -1228,3 +2035,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

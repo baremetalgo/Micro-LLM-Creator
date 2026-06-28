@@ -39,6 +39,7 @@ The app has three main work areas:
 - `IN`: prepare datasets.
 - `AI`: configure and train the model.
 - `X`: export and quantize model artifacts.
+- `TEST`: load a GGUF model and chat with it locally.
 
 ## 2. Recommended Workflow
 
@@ -53,6 +54,8 @@ The app has three main work areas:
 9. Resume training if interrupted.
 10. Open `X`.
 11. Bundle or quantize the trained model.
+12. Open `TEST`.
+13. Load a GGUF model and test prompts in the chat window.
 
 ## 3. Dataset Preparation
 
@@ -622,7 +625,136 @@ Copies model artifacts into an export folder.
 
 Creates an FP16 checkpoint today.
 
-## 6. Suggested Settings
+## 6. Test Chat Options
+
+The `TEST` tab is for trying a GGUF model through llama.cpp without reloading it
+for every message.
+
+Replies stream into the chat window and are rendered as Markdown. Fenced code
+blocks are syntax-highlighted when the `markdown` and `Pygments` packages from
+`requirements.txt` are installed.
+
+### GGUF Model
+
+Path to the `.gguf` file to load.
+
+Effect:
+
+- The model is loaded once in the background.
+- Later chat messages reuse the loaded model.
+- Large GGUF files can take time and memory to load.
+
+### Context
+
+The llama.cpp context window.
+
+Effect:
+
+- Larger context supports longer conversations.
+- Larger context uses more memory.
+
+### CPU Threads
+
+Number of CPU threads used for inference.
+
+Effect:
+
+- Higher values can improve speed.
+- Too high can make the desktop less responsive.
+
+### GPU Layers
+
+Number of model layers to offload to GPU when supported.
+
+Effect:
+
+- More GPU layers can improve speed.
+- Requires a compatible llama.cpp build and enough VRAM.
+- `-1` asks llama.cpp to offload all possible layers.
+
+Recommendation:
+
+- Use `-1` when you want the model to load on GPU.
+- If loading fails, install a GPU-enabled `llama-cpp-python` build or reduce the layer count.
+- If GPU layers are not `0` and the installed llama runtime is CPU-only, the app stops loading and shows a clear error instead of silently using CPU.
+
+Recommended CUDA install example using a prebuilt wheel:
+
+```powershell
+pip uninstall -y llama-cpp-python
+pip install --no-cache-dir --force-reinstall llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+```
+
+Use the wheel folder that matches your CUDA version, such as `cu121`, `cu122`,
+`cu123`, `cu124`, `cu125`, `cu130`, or `cu132`.
+
+Source-build CUDA install example:
+
+```powershell
+pip uninstall -y llama-cpp-python
+$env:CMAKE_ARGS="-DGGML_CUDA=on"
+$env:FORCE_CMAKE="1"
+pip install --no-cache-dir --force-reinstall llama-cpp-python
+```
+
+If source build fails with `CUDA Toolkit not found` or `Could not find nvcc`,
+install NVIDIA CUDA Toolkit first and ensure `nvcc --version` works in the same
+terminal.
+
+### Reasoning Effort
+
+Instruction style sent with each prompt.
+
+- `Fast`: shorter, speed-focused replies.
+- `Balanced`: clear default behavior.
+- `Deep`: asks the model for more careful reasoning.
+
+### Max Tokens
+
+Maximum new tokens for each reply.
+
+Effect:
+
+- Higher values allow longer answers.
+- Higher values take longer to generate.
+
+### Temperature
+
+Sampling randomness.
+
+Effect:
+
+- Lower values are more focused.
+- Higher values are more creative but less predictable.
+
+### Top-p
+
+Nucleus sampling cutoff.
+
+Effect:
+
+- Lower values restrict output to more likely tokens.
+- Higher values allow more variety.
+
+### Repeat Penalty
+
+Penalty for repeated text.
+
+Effect:
+
+- Higher values can reduce loops.
+- Too high can make wording unnatural.
+
+### System Prompt
+
+Optional behavior instruction for the chat.
+
+Effect:
+
+- Helps steer style, role, and answer format.
+- Does not retrain the model.
+
+## 7. Suggested Settings
 
 ### Smoke Test
 
@@ -663,7 +795,7 @@ Use this when you have more data and VRAM.
 - Batch size: `8+`
 - Gradient accumulation: increase if VRAM is limited
 
-## 7. Programming PDFs: Best Practice
+## 8. Programming PDFs: Best Practice
 
 Programming PDFs help most when used as explanation data. Raw PDF code is often
 damaged during extraction. For best results:
@@ -692,7 +824,7 @@ Avoid:
 - Vendor/build folders.
 - Duplicate content.
 
-## 8. How to Know Training Is Working
+## 9. How to Know Training Is Working
 
 Good signs:
 
@@ -716,7 +848,7 @@ Fixes:
 - Increase validation split slightly.
 - Use source-code files instead of PDF-only code.
 
-## 9. Important Limitations
+## 10. Important Limitations
 
 This app trains small models from scratch. A small model will not automatically
 match large commercial coding models. To improve behavior, you need:

@@ -10,6 +10,10 @@ from typing import Any, Callable, Optional
 import PyPDF2
 
 
+class OperationCancelled(RuntimeError):
+    """Raised when a long-running operation is cancelled by the user."""
+
+
 SUPPORTED_TEXT_SUFFIXES = {".txt", ".md", ".text"}
 SUPPORTED_CODE_SUFFIXES = {
     ".py": "python",
@@ -313,6 +317,7 @@ def load_documents(
     extract_code_blocks: bool = True,
     preserve_indentation: bool = True,
     progress: Optional[Callable[[Any], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> list[Document]:
     """Load supported files from a folder.
 
@@ -326,6 +331,7 @@ def load_documents(
         extract_code_blocks: Extracts code-like blocks from prose documents.
         preserve_indentation: Keeps code formatting where possible.
         progress: Optional callback receiving progress event dictionaries.
+        should_stop: Optional callback returning true when loading should stop.
 
     Returns:
         Sorted list of loaded document samples.
@@ -362,6 +368,10 @@ def load_documents(
             for path in supported_paths
         }
         for index, future in enumerate(as_completed(future_map), start=1):
+            if should_stop and should_stop():
+                for pending in future_map:
+                    pending.cancel()
+                raise OperationCancelled("Dataset preparation stopped by user.")
             path = future_map[future]
             percent = 10 + int(32 * index / max(len(supported_paths), 1))
             try:
@@ -383,6 +393,8 @@ def load_documents(
     if code_training_mode:
         expanded: list[Document] = []
         for document in documents:
+            if should_stop and should_stop():
+                raise OperationCancelled("Dataset preparation stopped by user.")
             if document.kind == "code":
                 expanded.append(document)
                 continue

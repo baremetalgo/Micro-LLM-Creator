@@ -67,12 +67,14 @@ class TrainingResult:
         summary_path: Training summary JSON path.
         final_train_loss: Final epoch training loss.
         final_val_loss: Final validation loss when available.
+        stopped: Whether training was stopped by the user.
     """
 
     checkpoint_path: Path
     summary_path: Path
     final_train_loss: float
     final_val_loss: Optional[float]
+    stopped: bool = False
 
 
 def emit_progress(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
@@ -196,6 +198,7 @@ def train_model(
     val_tokens: list[int],
     pad_token_id: int,
     progress: Optional[Callable[[Any], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> TrainingResult:
     """Train a MicroGPT model.
 
@@ -206,6 +209,7 @@ def train_model(
         val_tokens: Validation token stream.
         pad_token_id: Token ID ignored by cross-entropy loss.
         progress: Optional callback receiving progress dictionaries.
+        should_stop: Optional callback returning true when training should stop.
 
     Returns:
         Training result with checkpoint and summary paths.
@@ -277,6 +281,36 @@ def train_model(
     for epoch in range(start_epoch, training_config.epochs):
         epoch_losses: list[float] = []
         for batch_index, (x, y) in enumerate(train_loader):
+            if should_stop and should_stop():
+                final_train_loss = sum(epoch_losses) / max(len(epoch_losses), 1) if epoch_losses else final_train_loss
+                stopped_path = checkpoints_dir / f"checkpoint_stopped_step_{global_step}.pt"
+                save_checkpoint(
+                    stopped_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    model_config,
+                    training_config,
+                    global_step,
+                    epoch,
+                    final_train_loss,
+                    final_val_loss,
+                )
+                emit_progress(progress, f"Training stopped. Resume checkpoint saved: {stopped_path}", 100)
+                summary_path = training_config.output_dir / "training_summary.json"
+                summary = {
+                    "model_config": dataclass_to_jsonable(model_config),
+                    "training_config": dataclass_to_jsonable(training_config),
+                    "final_train_loss": final_train_loss,
+                    "final_val_loss": final_val_loss,
+                    "total_steps": global_step,
+                    "stopped": True,
+                    "resume_checkpoint": str(stopped_path),
+                    "parameters": sum(p.numel() for p in model.parameters()),
+                }
+                summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                return TrainingResult(stopped_path, summary_path, final_train_loss, final_val_loss, stopped=True)
             x = x.to(training_config.device)
             y = y.to(training_config.device)
             with autocast("cuda", enabled=use_amp):

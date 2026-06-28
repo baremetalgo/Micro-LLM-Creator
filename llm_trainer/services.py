@@ -99,12 +99,14 @@ def content_warning(character_count: int) -> Optional[str]:
 def build_dataset(
     config: DatasetConfig,
     progress: Optional[Callable[[Any], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> DatasetBuildResult:
     """Build a tokenizer-ready dataset project.
 
     Args:
         config: Dataset preparation settings.
         progress: Optional callback receiving progress event dictionaries.
+        should_stop: Optional callback returning true when the user requested stop.
 
     Returns:
         Dataset build summary.
@@ -125,7 +127,10 @@ def build_dataset(
         extract_code_blocks=config.extract_code_blocks,
         preserve_indentation=config.preserve_indentation,
         progress=progress,
+        should_stop=should_stop,
     )
+    if should_stop and should_stop():
+        raise RuntimeError("Dataset preparation stopped by user.")
     if not documents:
         raise ValueError("No supported text, PDF, or JSONL documents were found.")
 
@@ -147,6 +152,8 @@ def build_dataset(
 
     corpus_path = config.output_dir / "corpus.txt"
     _emit(progress, "Writing normalized corpus...", 56)
+    if should_stop and should_stop():
+        raise RuntimeError("Dataset preparation stopped by user.")
     write_training_corpus(
         documents,
         corpus_path,
@@ -155,6 +162,8 @@ def build_dataset(
     )
     tokenizer_path = config.output_dir / "tokenizer.json"
     _emit(progress, "Training tokenizer. This may take a while for large PDF folders...", 62)
+    if should_stop and should_stop():
+        raise RuntimeError("Dataset preparation stopped by user.")
     tokenizer = train_tokenizer(
         corpus_path,
         tokenizer_path,
@@ -163,6 +172,8 @@ def build_dataset(
     )
 
     _emit(progress, "Encoding corpus into token IDs...", 78)
+    if should_stop and should_stop():
+        raise RuntimeError("Dataset preparation stopped by user.")
     tokens = encode_text(tokenizer, all_text)
     _emit(progress, f"Encoded {len(tokens):,} tokens.", 86)
     train_tokens, val_tokens = split_tokens(tokens, config.validation_split)
@@ -203,6 +214,7 @@ def train_from_dataset(
     model_config: ModelConfig,
     training_config: TrainingConfig,
     progress: Optional[Callable[[Any], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> TrainingResult:
     """Train a model using a prepared dataset folder.
 
@@ -211,6 +223,7 @@ def train_from_dataset(
         model_config: Model architecture settings.
         training_config: Optimizer and checkpoint settings.
         progress: Optional callback receiving progress event dictionaries.
+        should_stop: Optional callback returning true when the user requested stop.
 
     Returns:
         Training result with final checkpoint and summary paths.
@@ -244,4 +257,5 @@ def train_from_dataset(
         val_tokens,
         pad_token_id=token_id(tokenizer, PAD_TOKEN),
         progress=progress,
+        should_stop=should_stop,
     )
