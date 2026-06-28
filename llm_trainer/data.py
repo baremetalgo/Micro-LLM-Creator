@@ -5,7 +5,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import PyPDF2
 
@@ -47,7 +47,7 @@ SUPPORTED_CODE_SUFFIXES = {
 }
 
 
-@dataclass(slots=True)
+@dataclass
 class Document:
     """Loaded training sample.
 
@@ -61,7 +61,7 @@ class Document:
     path: Path
     text: str
     kind: str = "prose"
-    language: str | None = None
+    language: Optional[str] = None
 
 
 def clean_text(text: str, lowercase: bool = False) -> str:
@@ -147,7 +147,7 @@ def read_supported_document(
     lowercase: bool = False,
     code_training_mode: bool = False,
     preserve_indentation: bool = True,
-) -> Document | None:
+) -> Optional[Document]:
     """Read one supported document or source-code file.
 
     Args:
@@ -207,7 +207,7 @@ def is_code_like_line(line: str) -> bool:
     return symbol_count >= 3 or line.startswith(("    ", "\t"))
 
 
-def guess_language(text: str, fallback: str | None = None) -> str | None:
+def guess_language(text: str, fallback: Optional[str] = None) -> Optional[str]:
     """Guess a programming language from code text.
 
     Args:
@@ -312,7 +312,7 @@ def load_documents(
     include_source_code: bool = True,
     extract_code_blocks: bool = True,
     preserve_indentation: bool = True,
-    progress: Callable[[Any], None] | None = None,
+    progress: Optional[Callable[[Any], None]] = None,
 ) -> list[Document]:
     """Load supported files from a folder.
 

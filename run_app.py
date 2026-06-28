@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from llm_trainer.ui.app import main
 
 

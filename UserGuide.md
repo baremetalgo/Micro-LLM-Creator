@@ -19,6 +19,21 @@ Start the app:
 python run_app.py
 ```
 
+On Linux/macOS, use:
+
+```bash
+python3 run_app.py
+```
+
+If you want to launch it directly as `./run_app.py`, mark it executable once:
+
+```bash
+chmod +x run_app.py
+./run_app.py
+```
+
+Minimum supported Python version is Python 3.9.
+
 The app has three main work areas:
 
 - `IN`: prepare datasets.
@@ -145,7 +160,7 @@ Keeps prose from books, PDFs, and tutorials.
 Effect:
 
 - Helps the model learn concepts, descriptions, and explanatory language.
-- Useful for “explain this code” behavior.
+- Useful for "explain this code" behavior.
 - Too much prose without code can reduce code density.
 
 Recommendation:
@@ -713,6 +728,5 @@ match large commercial coding models. To improve behavior, you need:
 - Instruction-style examples.
 - Evaluation prompts.
 
-For “thinking” behavior, train on examples that show step-by-step reasoning,
+For "thinking" behavior, train on examples that show step-by-step reasoning,
 debugging, explanation, and code review patterns.
-

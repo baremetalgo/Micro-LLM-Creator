@@ -4,7 +4,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -58,7 +58,7 @@ class TokenDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
-@dataclass(slots=True)
+@dataclass
 class TrainingResult:
     """Result returned after training.
 
@@ -72,10 +72,10 @@ class TrainingResult:
     checkpoint_path: Path
     summary_path: Path
     final_train_loss: float
-    final_val_loss: float | None
+    final_val_loss: Optional[float]
 
 
-def emit_progress(progress: Callable[[Any], None] | None, message: str, percent: int | None = None) -> None:
+def emit_progress(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
     """Emit training progress if a callback is available.
 
     Args:
@@ -171,7 +171,7 @@ def evaluate(model: MicroGPT, loader: DataLoader, device: str, pad_token_id: int
     return sum(losses) / max(len(losses), 1)
 
 
-def latest_checkpoint(checkpoints_dir: Path) -> Path | None:
+def latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     """Find the newest checkpoint in a folder.
 
     Args:
@@ -195,7 +195,7 @@ def train_model(
     train_tokens: list[int],
     val_tokens: list[int],
     pad_token_id: int,
-    progress: Callable[[Any], None] | None = None,
+    progress: Optional[Callable[[Any], None]] = None,
 ) -> TrainingResult:
     """Train a MicroGPT model.
 
@@ -249,7 +249,7 @@ def train_model(
     global_step = 0
     start_epoch = 0
     final_train_loss = 0.0
-    final_val_loss: float | None = None
+    final_val_loss: Optional[float] = None
 
     resume_path = training_config.resume_from_checkpoint if training_config.resume else None
     if resume_path is None and training_config.resume:
@@ -387,7 +387,7 @@ def save_checkpoint(
     global_step: int,
     epoch: int,
     train_loss: float,
-    val_loss: float | None,
+    val_loss: Optional[float],
 ) -> None:
     """Save a resumable training checkpoint.
 

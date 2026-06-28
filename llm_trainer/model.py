@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -216,7 +217,7 @@ class MicroGPT(nn.Module):
         idx: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 0.8,
-        top_k: int | None = 50,
+        top_k: Optional[int] = 50,
     ) -> torch.Tensor:
         """Autoregressively sample new tokens.
 

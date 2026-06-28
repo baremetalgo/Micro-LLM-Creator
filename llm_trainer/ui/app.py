@@ -4,7 +4,7 @@ import ctypes
 from queue import Empty, Queue
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
@@ -46,7 +46,7 @@ class TaskWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn: Any, *args: Any, progress_queue: Queue | None = None, with_progress: bool = False) -> None:
+    def __init__(self, fn: Any, *args: Any, progress_queue: Optional[Queue] = None, with_progress: bool = False) -> None:
         """Create a worker.
 
         Args:
@@ -91,12 +91,12 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(self._lightning_icon())
         self._windows_icon_handles: list[int] = []
         self.resize(1240, 820)
-        self.thread: QThread | None = None
-        self.worker: TaskWorker | None = None
-        self.progress_queue: Queue | None = None
-        self.active_log: QTextEdit | None = None
-        self.active_progress_bar: QProgressBar | None = None
-        self.active_button: QPushButton | None = None
+        self.thread: Optional[QThread] = None
+        self.worker: Optional[TaskWorker] = None
+        self.progress_queue: Optional[Queue] = None
+        self.active_log: Optional[QTextEdit] = None
+        self.active_progress_bar: Optional[QProgressBar] = None
+        self.active_button: Optional[QPushButton] = None
         self.active_button_text = ""
         self.active_button_restore_text = ""
         self.spinner_index = 0
@@ -642,7 +642,7 @@ class MainWindow(QMainWindow):
         label.setObjectName("PageTitle")
         return label
 
-    def _card(self, title: str, content_layout: QVBoxLayout | QFormLayout | QGridLayout | QHBoxLayout) -> QWidget:
+    def _card(self, title: str, content_layout: Union[QVBoxLayout, QFormLayout, QGridLayout, QHBoxLayout]) -> QWidget:
         """Create a neon module card.
 
         Args:
@@ -820,7 +820,7 @@ class MainWindow(QMainWindow):
         return Path(__file__).with_name("micro_llm_creator_lightning.ico")
 
     @staticmethod
-    def _ensure_windows_icon_file() -> Path | None:
+    def _ensure_windows_icon_file() -> Optional[Path]:
         """Ensure the generated Windows ``.ico`` file exists.
 
         Returns:
@@ -890,7 +890,7 @@ class MainWindow(QMainWindow):
         log: QTextEdit,
         progress_bar: QProgressBar,
         with_progress: bool = False,
-        button: QPushButton | None = None,
+        button: Optional[QPushButton] = None,
         busy_text: str = "Working",
     ) -> None:
         """Run a long task on a background thread.
@@ -1010,7 +1010,7 @@ class MainWindow(QMainWindow):
         button.setText(f"| {text}")
         self.spinner_timer.start(150)
 
-    def _clear_button_busy(self, final_text: str | None = None) -> None:
+    def _clear_button_busy(self, final_text: Optional[str] = None) -> None:
         """Restore the active busy button.
 
         Args:

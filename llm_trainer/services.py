@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .config import DatasetConfig, ModelConfig, TrainingConfig, dataclass_to_jsonable
 from .data import load_documents, write_training_corpus
@@ -11,7 +11,7 @@ from .tokenizer import PAD_TOKEN, encode_text, token_id, train_tokenizer
 from .training import TrainingResult, split_tokens, train_model
 
 
-@dataclass(slots=True)
+@dataclass
 class DatasetBuildResult:
     """Result returned after dataset preparation.
 
@@ -35,12 +35,12 @@ class DatasetBuildResult:
     vocab_size: int
     character_count: int
     suggested_vocab_size: int
-    warning: str | None = None
+    warning: Optional[str] = None
     code_sample_count: int = 0
     prose_sample_count: int = 0
 
 
-def _emit(progress: Callable[[Any], None] | None, message: str, percent: int | None = None) -> None:
+def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
     """Emit a progress event if a callback is available.
 
     Args:
@@ -79,7 +79,7 @@ def estimate_vocab_size(character_count: int, unique_word_count: int) -> int:
     return max(256, min(ceiling, desired))
 
 
-def content_warning(character_count: int) -> str | None:
+def content_warning(character_count: int) -> Optional[str]:
     """Return a corpus-size warning when the dataset is small.
 
     Args:
@@ -98,7 +98,7 @@ def content_warning(character_count: int) -> str | None:
 
 def build_dataset(
     config: DatasetConfig,
-    progress: Callable[[Any], None] | None = None,
+    progress: Optional[Callable[[Any], None]] = None,
 ) -> DatasetBuildResult:
     """Build a tokenizer-ready dataset project.
 
@@ -202,7 +202,7 @@ def train_from_dataset(
     data_dir: Path,
     model_config: ModelConfig,
     training_config: TrainingConfig,
-    progress: Callable[[Any], None] | None = None,
+    progress: Optional[Callable[[Any], None]] = None,
 ) -> TrainingResult:
     """Train a model using a prepared dataset folder.
 

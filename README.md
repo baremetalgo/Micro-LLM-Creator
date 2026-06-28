@@ -1,12 +1,25 @@
-<p3 align="center">Copyright @ Intelligent Network for Deliberation, Reasoning & Action (INDRA)</p>
-<p>contact - contact.nilesh.jadhav@gmail.com</p>
-
 # Micro LLM Creator
-<p align="center">
-  <img src="example.png" width="100%">
-</p>
-Backend foundation for a PySide6 app that prepares text datasets and trains
-small GPT-style language models.
+
+PySide6 desktop app for preparing text/code datasets and training small
+GPT-style language models.
+
+Requires Python 3.9 or newer.
+
+Launch the desktop app:
+
+```bash
+python3 run_app.py
+```
+
+On Linux/macOS, direct execution also needs:
+
+```bash
+chmod +x run_app.py
+./run_app.py
+```
+
+If direct execution prints `Permission denied`, use `python3 run_app.py` or run
+the `chmod` command above once after cloning.
 
 ## First backend commands
 

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
 
-@dataclass(slots=True)
+@dataclass
 class DatasetConfig:
     """Configuration for building a tokenizer-ready dataset.
 
@@ -30,7 +30,7 @@ class DatasetConfig:
 
     input_dir: Path
     output_dir: Path
-    vocab_size: int | None = None
+    vocab_size: Optional[int] = None
     min_frequency: int = 2
     context_length: int = 128
     validation_split: float = 0.1
@@ -44,7 +44,7 @@ class DatasetConfig:
     generate_instruction_samples: bool = True
 
 
-@dataclass(slots=True)
+@dataclass
 class ModelConfig:
     """Configuration for the GPT-style model architecture.
 
@@ -81,7 +81,7 @@ class ModelConfig:
             raise ValueError("vocab_size is too small for language modeling")
 
 
-@dataclass(slots=True)
+@dataclass
 class TrainingConfig:
     """Configuration for model optimization and checkpointing.
 
@@ -117,7 +117,7 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 1337
     resume: bool = True
-    resume_from_checkpoint: Path | None = None
+    resume_from_checkpoint: Optional[Path] = None
 
 
 def dataclass_to_jsonable(value: Any) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -9,7 +10,7 @@ from .model import MicroGPT
 from .tokenizer import EOS_TOKEN, load_tokenizer, token_id
 
 
-def load_model_from_checkpoint(checkpoint_path: Path, device: str | None = None) -> MicroGPT:
+def load_model_from_checkpoint(checkpoint_path: Path, device: Optional[str] = None) -> MicroGPT:
     """Load a trained MicroGPT checkpoint.
 
     Args:
@@ -37,8 +38,8 @@ def generate_text(
     prompt: str,
     max_new_tokens: int = 100,
     temperature: float = 0.8,
-    top_k: int | None = 50,
-    device: str | None = None,
+    top_k: Optional[int] = 50,
+    device: Optional[str] = None,
 ) -> str:
     """Generate text from a trained checkpoint.
 
