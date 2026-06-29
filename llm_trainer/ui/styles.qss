@@ -26,6 +26,12 @@ QWidget#Card {
     border-radius: 8px;
 }
 
+QWidget#LossChart {
+    background: #141414;
+    border: 1px solid #3d3d3d;
+    border-radius: 8px;
+}
+
 QLabel {
     color: #dddddd;
     font-size: 13px;
@@ -33,13 +39,13 @@ QLabel {
 
 QLabel#Logo {
     color: #f5b041;
-    font-size: 24px;
+    font-size: 23px;
     font-weight: 900;
 }
 
 QLabel#PageTitle {
     color: #f2f2f2;
-    font-size: 25px;
+    font-size: 24px;
     font-weight: 700;
 }
 
@@ -55,7 +61,7 @@ QLabel#TopStatus {
     background: #20231d;
     border: 1px solid #8fbf5a;
     border-radius: 7px;
-    padding: 6px 9px;
+    padding: 5px 8px;
     font-size: 12px;
 }
 
@@ -63,6 +69,16 @@ QLabel#Metric {
     color: #b6d77a;
     font-size: 14px;
     font-weight: 700;
+}
+
+QLabel#MetricChip {
+    color: #d8eec2;
+    background: #1b1f18;
+    border: 1px solid #6f8f45;
+    border-radius: 7px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 800;
 }
 
 QLabel#MessageMeta {
@@ -76,8 +92,8 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     color: #f0f0f0;
     border: 1px solid #555555;
     border-radius: 7px;
-    padding: 8px 10px;
-    min-height: 22px;
+    padding: 5px 8px;
+    min-height: 20px;
 }
 
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
@@ -95,7 +111,7 @@ QPushButton {
     color: #eeeeee;
     border: 1px solid #555555;
     border-radius: 7px;
-    padding: 9px 14px;
+    padding: 7px 12px;
     font-weight: 800;
 }
 
@@ -122,9 +138,10 @@ QPushButton#NavButton {
     color: #dddddd;
     border: 1px solid #4a4a4a;
     border-radius: 8px;
-    min-width: 42px;
-    min-height: 42px;
+    min-width: 52px;
+    min-height: 52px;
     padding: 0;
+    font-size: 12px;
 }
 
 QPushButton#NavButton:checked, QPushButton#NavButton:hover {
@@ -153,7 +170,7 @@ QTextEdit {
     color: #eeeeee;
     border: 1px solid #555555;
     border-radius: 8px;
-    padding: 10px;
+    padding: 8px;
     font-family: Consolas, monospace;
     font-size: 12px;
 }
@@ -163,13 +180,19 @@ QTextBrowser {
     color: #eeeeee;
     border: 1px solid #555555;
     border-radius: 8px;
-    padding: 16px;
+    padding: 12px;
     font-family: Arial, "Segoe UI", sans-serif;
     font-size: 14px;
 }
 
 QScrollArea#ChatScroll {
     background: #111111;
+    border: 0;
+    border-radius: 0;
+}
+
+QScrollArea#PageScroll {
+    background: #181818;
     border: 0;
     border-radius: 0;
 }
@@ -202,7 +225,7 @@ QTextEdit#ChatInput, QTextEdit#SystemPrompt {
     color: #eeeeee;
     border: 1px solid #555555;
     border-radius: 8px;
-    padding: 10px;
+    padding: 8px;
     font-family: Arial, "Segoe UI", sans-serif;
     font-size: 13px;
 }

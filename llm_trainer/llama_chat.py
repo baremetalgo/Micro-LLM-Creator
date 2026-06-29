@@ -84,6 +84,7 @@ class LlamaChatSession:
         top_p: float = 0.9,
         repeat_penalty: float = 1.1,
         reasoning_effort: str = "Balanced",
+        thinking_enabled: bool = True,
     ) -> str:
         """Generate one assistant reply.
 
@@ -95,12 +96,13 @@ class LlamaChatSession:
             top_p: Nucleus sampling value.
             repeat_penalty: Repetition penalty.
             reasoning_effort: User-facing effort mode.
+            thinking_enabled: Whether to add reasoning-style system guidance.
 
         Returns:
             Assistant reply text.
         """
 
-        effort_instruction = self._effort_instruction(reasoning_effort)
+        effort_instruction = self._effort_instruction(reasoning_effort) if thinking_enabled else self._plain_instruction()
         messages = []
         if system_prompt.strip() or effort_instruction:
             messages.append({"role": "system", "content": "\n".join(part for part in (system_prompt.strip(), effort_instruction) if part)})
@@ -129,6 +131,7 @@ class LlamaChatSession:
         top_p: float = 0.9,
         repeat_penalty: float = 1.1,
         reasoning_effort: str = "Balanced",
+        thinking_enabled: bool = True,
         progress: Optional[Callable[[Any], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> dict[str, Any]:
@@ -142,6 +145,7 @@ class LlamaChatSession:
             top_p: Nucleus sampling value.
             repeat_penalty: Repetition penalty.
             reasoning_effort: User-facing effort mode.
+            thinking_enabled: Whether to add reasoning-style system guidance.
             progress: Optional callback receiving stream events.
             should_stop: Optional callback returning true when generation should stop.
 
@@ -149,7 +153,7 @@ class LlamaChatSession:
             Reply text and generation metrics.
         """
 
-        effort_instruction = self._effort_instruction(reasoning_effort)
+        effort_instruction = self._effort_instruction(reasoning_effort) if thinking_enabled else self._plain_instruction()
         messages = []
         if system_prompt.strip() or effort_instruction:
             messages.append({"role": "system", "content": "\n".join(part for part in (system_prompt.strip(), effort_instruction) if part)})
@@ -235,6 +239,16 @@ class LlamaChatSession:
             return "Think carefully, reason through the problem, and provide a detailed answer when useful. Put code inside fenced Markdown code blocks with language labels."
         return "Use balanced reasoning and answer clearly. Put code inside fenced Markdown code blocks with language labels."
 
+    @staticmethod
+    def _plain_instruction() -> str:
+        """Return the non-thinking chat formatting instruction.
+
+        Returns:
+            Plain response instruction.
+        """
+
+        return "Answer directly. Put code inside fenced Markdown code blocks with language labels."
+
 
 def load_llama_chat_session(model_path: Path, n_ctx: int, n_threads: int, n_gpu_layers: int) -> LlamaChatSession:
     """Load a GGUF chat session.
@@ -261,6 +275,7 @@ def generate_chat_reply(
     top_p: float,
     repeat_penalty: float,
     reasoning_effort: str,
+    thinking_enabled: bool = True,
 ) -> str:
     """Generate a reply from a loaded chat session.
 
@@ -273,6 +288,7 @@ def generate_chat_reply(
         top_p: Nucleus sampling value.
         repeat_penalty: Repetition penalty.
         reasoning_effort: Effort mode label.
+        thinking_enabled: Whether reasoning-style guidance is enabled.
 
     Returns:
         Assistant reply.
@@ -286,6 +302,7 @@ def generate_chat_reply(
         top_p=top_p,
         repeat_penalty=repeat_penalty,
         reasoning_effort=reasoning_effort,
+        thinking_enabled=thinking_enabled,
     )
 
 
@@ -298,6 +315,7 @@ def stream_chat_reply(
     top_p: float,
     repeat_penalty: float,
     reasoning_effort: str,
+    thinking_enabled: bool = True,
     progress: Optional[Callable[[Any], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict[str, Any]:
@@ -312,6 +330,7 @@ def stream_chat_reply(
         top_p: Nucleus sampling value.
         repeat_penalty: Repetition penalty.
         reasoning_effort: Effort mode label.
+        thinking_enabled: Whether reasoning-style guidance is enabled.
         progress: Optional stream event callback.
         should_stop: Optional cancellation callback.
 
@@ -327,6 +346,7 @@ def stream_chat_reply(
         top_p=top_p,
         repeat_penalty=repeat_penalty,
         reasoning_effort=reasoning_effort,
+        thinking_enabled=thinking_enabled,
         progress=progress,
         should_stop=should_stop,
     )

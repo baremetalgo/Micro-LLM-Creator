@@ -40,6 +40,8 @@ class DatasetBuildResult:
         prose_sample_count: Number of prose samples.
         cached_file_count: Number of unchanged source files reused from cache.
         processed_file_count: Number of source files extracted this run.
+        skipped_file_count: Number of files with no readable text.
+        failed_file_count: Number of files that failed extraction.
         dataset_version_id: Unique dataset version identifier.
         dataset_version_number: One-based dataset version number.
     """
@@ -56,6 +58,8 @@ class DatasetBuildResult:
     prose_sample_count: int = 0
     cached_file_count: int = 0
     processed_file_count: int = 0
+    skipped_file_count: int = 0
+    failed_file_count: int = 0
     dataset_version_id: str = ""
     dataset_version_number: int = 0
 
@@ -238,7 +242,7 @@ def _load_documents_with_cache(
     config: DatasetConfig,
     progress: Optional[Callable[[Any], None]],
     should_stop: Optional[Callable[[], bool]],
-) -> tuple[list[Any], dict[str, Any], int, int]:
+) -> tuple[list[Any], dict[str, Any], int, int, int, int]:
     """Load documents using an extraction cache.
 
     Args:
@@ -247,7 +251,7 @@ def _load_documents_with_cache(
         should_stop: Optional cancellation callback.
 
     Returns:
-        Documents, manifest, cached file count, processed file count.
+        Documents, manifest, cached, processed, skipped, and failed file counts.
     """
 
     manifest_path = config.output_dir / "dataset_manifest.json"
@@ -267,6 +271,8 @@ def _load_documents_with_cache(
     documents: list[Any] = []
     cached_count = 0
     processed_count = 0
+    skipped_count = 0
+    failed_count = 0
     new_files: dict[str, Any] = {}
 
     for index, path in enumerate(source_paths, start=1):
@@ -293,14 +299,37 @@ def _load_documents_with_cache(
             cached_count += 1
             _emit(progress, f"Reused {path.name} from cache ({len(cached_documents)} sample(s)).", percent)
         else:
-            source_doc = read_supported_document(
-                path,
-                lowercase=config.lowercase,
-                code_training_mode=config.code_training_mode,
-                preserve_indentation=config.preserve_indentation,
-            )
+            try:
+                source_doc = read_supported_document(
+                    path,
+                    lowercase=config.lowercase,
+                    code_training_mode=config.code_training_mode,
+                    preserve_indentation=config.preserve_indentation,
+                )
+            except Exception as exc:
+                failed_count += 1
+                _emit(progress, f"Failed {path.name}: {exc}", percent)
+                new_files[manifest_key] = {
+                    "path": str(path),
+                    "sha256": digest,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "cache_key": key,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                continue
             if source_doc is None:
+                skipped_count += 1
                 _emit(progress, f"Skipped {path.name}: no readable text found.", percent)
+                new_files[manifest_key] = {
+                    "path": str(path),
+                    "sha256": digest,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "cache_key": key,
+                    "status": "skipped_empty",
+                }
                 continue
             source_documents = [source_doc]
             if config.code_training_mode:
@@ -326,12 +355,20 @@ def _load_documents_with_cache(
             "mtime_ns": stat.st_mtime_ns,
             "cache_key": key,
             "cache_file": str(cache_path.relative_to(config.output_dir)),
+            "status": "cached" if can_use_cache else "processed",
         }
 
     manifest["files"] = new_files
     manifest["dataset_config"] = dataclass_to_jsonable(config)
     manifest["cache_key"] = key
-    return sorted(documents, key=lambda document: (str(document.path), document.kind, document.language or "")), manifest, cached_count, processed_count
+    return (
+        sorted(documents, key=lambda document: (str(document.path), document.kind, document.language or "")),
+        manifest,
+        cached_count,
+        processed_count,
+        skipped_count,
+        failed_count,
+    )
 
 
 def build_dataset(
@@ -355,7 +392,14 @@ def build_dataset(
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     _emit(progress, "Scanning source folder...", 3)
-    documents, manifest, cached_file_count, processed_file_count = _load_documents_with_cache(config, progress, should_stop)
+    (
+        documents,
+        manifest,
+        cached_file_count,
+        processed_file_count,
+        skipped_file_count,
+        failed_file_count,
+    ) = _load_documents_with_cache(config, progress, should_stop)
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
     if not documents:
@@ -374,6 +418,8 @@ def build_dataset(
         _emit(progress, f"Code mode: {code_sample_count:,} code samples, {prose_sample_count:,} prose samples.", 46)
     if cached_file_count or processed_file_count:
         _emit(progress, f"Cache: reused {cached_file_count:,} file(s), processed {processed_file_count:,} file(s).", 47)
+    if skipped_file_count or failed_file_count:
+        _emit(progress, f"Quality: skipped {skipped_file_count:,} empty file(s), failed {failed_file_count:,} file(s).", 48)
     _emit(progress, f"Unique word estimate: {unique_words:,}.", 48)
     _emit(progress, f"Auto vocabulary size: {selected_vocab_size:,}.", 50)
     if warning:
@@ -427,6 +473,9 @@ def build_dataset(
         "source_files": [str(doc.path) for doc in documents],
         "cached_file_count": cached_file_count,
         "processed_file_count": processed_file_count,
+        "skipped_file_count": skipped_file_count,
+        "failed_file_count": failed_file_count,
+        "source_file_count": len(manifest.get("files", {})),
         "prepare_mode": config.prepare_mode,
         "tokenizer_strategy": config.tokenizer_strategy,
         "reasoning_sample_mode": config.reasoning_sample_mode,
@@ -452,6 +501,8 @@ def build_dataset(
         prose_sample_count,
         cached_file_count,
         processed_file_count,
+        skipped_file_count,
+        failed_file_count,
         str(dataset_version["version_id"]),
         int(dataset_version["version_number"]),
     )

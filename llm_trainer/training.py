@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -77,17 +79,23 @@ class TrainingResult:
     stopped: bool = False
 
 
-def emit_progress(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
+def emit_progress(
+    progress: Optional[Callable[[Any], None]],
+    message: str,
+    percent: Optional[int] = None,
+    **metrics: Any,
+) -> None:
     """Emit training progress if a callback is available.
 
     Args:
         progress: Optional callback for progress dictionaries.
         message: Human-readable status message.
         percent: Optional progress percentage.
+        **metrics: Optional structured metrics for UI dashboards.
     """
 
     if progress:
-        progress({"message": message, "percent": percent})
+        progress({"message": message, "percent": percent, **metrics})
 
 
 def set_seed(seed: int) -> None:
@@ -278,6 +286,8 @@ def train_model(
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    last_metric_time = perf_counter()
+    step_time_window: list[float] = []
     for epoch in range(start_epoch, training_config.epochs):
         epoch_losses: list[float] = []
         for batch_index, (x, y) in enumerate(train_loader):
@@ -325,17 +335,57 @@ def train_model(
             scaler.scale(loss).backward()
             if (batch_index + 1) % training_config.gradient_accumulation == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
+                grad_norm = float(grad_norm_tensor.item() if hasattr(grad_norm_tensor, "item") else grad_norm_tensor)
+                weight_norm = math.sqrt(
+                    sum(float(parameter.detach().float().norm(2).item()) ** 2 for parameter in model.parameters())
+                )
+                learning_rate = float(scheduler.get_last_lr()[0])
+                update_ratio = learning_rate * grad_norm / max(weight_norm, 1e-12)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
+                now = perf_counter()
+                step_seconds = max(now - last_metric_time, 1e-9)
+                last_metric_time = now
+                step_time_window.append(step_seconds)
+                step_time_window = step_time_window[-50:]
+                average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1)
+                remaining_steps = max(total_steps - global_step, 0)
+                eta_seconds = remaining_steps * average_step_seconds
+                samples_seen = training_config.batch_size * training_config.gradient_accumulation
+                tokens_seen = samples_seen * model_config.context_length
+                vram_allocated_gb = None
+                vram_reserved_gb = None
+                if training_config.device.startswith("cuda") and torch.cuda.is_available():
+                    device_index = torch.cuda.current_device()
+                    vram_allocated_gb = torch.cuda.memory_allocated(device_index) / (1024 ** 3)
+                    vram_reserved_gb = torch.cuda.memory_reserved(device_index) / (1024 ** 3)
                 current_progress = 8 + int(86 * min(global_step, total_steps) / max(total_steps, 1))
                 emit_progress(
                     progress,
                     f"Epoch {epoch + 1}/{training_config.epochs}, step {global_step}/{total_steps}, loss {float(loss.item() * training_config.gradient_accumulation):.4f}",
                     current_progress,
+                    epoch=epoch + 1,
+                    total_epochs=training_config.epochs,
+                    step=global_step,
+                    total_steps=total_steps,
+                    train_loss=float(loss.item() * training_config.gradient_accumulation),
+                    val_loss=final_val_loss,
+                    learning_rate=learning_rate,
+                    grad_norm=grad_norm,
+                    weight_norm=weight_norm,
+                    update_ratio=update_ratio,
+                    tokens_per_second=tokens_seen / step_seconds,
+                    samples_per_second=samples_seen / step_seconds,
+                    step_seconds=step_seconds,
+                    average_step_seconds=average_step_seconds,
+                    eta_seconds=eta_seconds,
+                    remaining_steps=remaining_steps,
+                    vram_allocated_gb=vram_allocated_gb,
+                    vram_reserved_gb=vram_reserved_gb,
                 )
 
                 if (
@@ -344,6 +394,17 @@ def train_model(
                     and global_step % training_config.eval_interval == 0
                 ):
                     final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id)
+                    emit_progress(
+                        progress,
+                        f"Validation loss at step {global_step}: {final_val_loss:.4f}",
+                        current_progress,
+                        epoch=epoch + 1,
+                        total_epochs=training_config.epochs,
+                        step=global_step,
+                        total_steps=total_steps,
+                        train_loss=epoch_losses[-1] if epoch_losses else None,
+                        val_loss=final_val_loss,
+                    )
 
                 if training_config.save_interval > 0 and global_step % training_config.save_interval == 0:
                     save_checkpoint(
@@ -380,7 +441,17 @@ def train_model(
             final_train_loss,
             final_val_loss,
         )
-        emit_progress(progress, f"Epoch {epoch + 1} complete. Checkpoint saved.", 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)))
+        emit_progress(
+            progress,
+            f"Epoch {epoch + 1} complete. Checkpoint saved.",
+            8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)),
+            epoch=epoch + 1,
+            total_epochs=training_config.epochs,
+            step=global_step,
+            total_steps=total_steps,
+            train_loss=final_train_loss,
+            val_loss=final_val_loss,
+        )
 
     checkpoint_path = training_config.output_dir / "final_model.pt"
     save_checkpoint(
@@ -406,7 +477,17 @@ def train_model(
         "parameters": sum(p.numel() for p in model.parameters()),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    emit_progress(progress, "Training complete.", 100)
+    emit_progress(
+        progress,
+        "Training complete.",
+        100,
+        epoch=training_config.epochs,
+        total_epochs=training_config.epochs,
+        step=global_step,
+        total_steps=total_steps,
+        train_loss=final_train_loss,
+        val_loss=final_val_loss,
+    )
     return TrainingResult(checkpoint_path, summary_path, final_train_loss, final_val_loss)
 
 

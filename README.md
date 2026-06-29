@@ -1,10 +1,20 @@
 <p align="center">copyright @ Indra (Intelligent Network for Deliberation, Reasoning & Action)</p>
 
 # Micro LLM Creator
-<p align="center"><img src="03.png" width="50%" /><img src="04.png" width="50%" /></p>
-<p align="center"><img src="01.png" width="50" /><img src="02.png" width="50%" /></p>
 
-Desktop app for preparing text/code datasets and training small model.
+<p align="center">
+  <img src="03.png" width="49%" />
+  <img src="04.png" width="49%" />
+</p>
+<p align="center">
+  <img src="01.png" width="49%" />
+  <img src="02.png" width="49%" />
+</p>
+
+Micro LLM Creator is a PySide6 desktop app for preparing text/code datasets,
+creating tokenizers, training small GPT-style language models, benchmarking
+checkpoints, exporting model artifacts, and testing local GGUF models in a
+streamed Markdown chat interface.
 
 Requires Python 3.9 or newer.
 

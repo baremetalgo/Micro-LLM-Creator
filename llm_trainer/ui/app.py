@@ -14,7 +14,7 @@ from typing import Any, Optional, Union
 from urllib.parse import quote
 
 import torch
-from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QPointF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -99,10 +99,165 @@ class TaskWorker(QObject):
             self.progress_queue.put(event)
 
     def _should_stop(self) -> bool:
-        """Return whether the task has been asked to stop."""
+        """Return whether the active task has been asked to stop.
+
+        Returns:
+            True when the cooperative stop event is set.
+        """
 
         return bool(self.stop_event and self.stop_event.is_set())
 
+
+class LossChartWidget(QWidget):
+    """Compact live chart for one or two training metric series."""
+
+    def __init__(
+        self,
+        primary_label: str = "Train",
+        secondary_label: str = "Val",
+        empty_text: str = "Loss chart will appear during training",
+    ) -> None:
+        """Create an empty chart widget.
+
+        Args:
+            primary_label: Label for the primary series.
+            secondary_label: Label for the secondary series.
+            empty_text: Text shown before samples arrive.
+        """
+
+        super().__init__()
+        self.setObjectName("LossChart")
+        self.setMinimumHeight(130)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.primary_label = primary_label
+        self.secondary_label = secondary_label
+        self.empty_text = empty_text
+        self.train_points: list[tuple[int, float]] = []
+        self.val_points: list[tuple[int, float]] = []
+
+    def clear(self) -> None:
+        """Remove all plotted loss values."""
+
+        self.train_points.clear()
+        self.val_points.clear()
+        self.update()
+
+    def add_metrics(self, step: int, train_loss: Optional[float], val_loss: Optional[float]) -> None:
+        """Add a training metric sample.
+
+        Args:
+            step: Optimizer step for the sample.
+            train_loss: Optional training loss value.
+            val_loss: Optional validation loss value.
+        """
+
+        if train_loss is not None:
+            self.train_points.append((step, float(train_loss)))
+        if val_loss is not None:
+            self.val_points.append((step, float(val_loss)))
+        self.train_points = self.train_points[-400:]
+        self.val_points = self.val_points[-400:]
+        self.update()
+
+    def add_values(self, step: int, primary_value: Optional[float], secondary_value: Optional[float] = None) -> None:
+        """Add a generic metric sample.
+
+        Args:
+            step: Optimizer step for the sample.
+            primary_value: Primary series value.
+            secondary_value: Optional secondary series value.
+        """
+
+        self.add_metrics(step, primary_value, secondary_value)
+
+    def paintEvent(self, event: Any) -> None:
+        """Render the chart.
+
+        Args:
+            event: Qt paint event.
+        """
+
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(12, 10, -12, -18)
+        painter.fillRect(self.rect(), QColor("#141414"))
+        painter.setPen(QPen(QColor("#3d3d3d"), 1))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 8, 8)
+
+        all_points = self.train_points + self.val_points
+        if not all_points:
+            painter.setPen(QColor("#8d8d8d"))
+            painter.drawText(rect, Qt.AlignCenter, self.empty_text)
+            painter.end()
+            return
+
+        min_step = min(step for step, _ in all_points)
+        max_step = max(step for step, _ in all_points)
+        min_loss = min(loss for _, loss in all_points)
+        max_loss = max(loss for _, loss in all_points)
+        if max_step == min_step:
+            max_step += 1
+        if max_loss == min_loss:
+            max_loss += 1.0
+        loss_padding = (max_loss - min_loss) * 0.08
+        min_loss = max(0.0, min_loss - loss_padding)
+        max_loss += loss_padding
+
+        painter.setPen(QPen(QColor("#333333"), 1))
+        for index in range(1, 4):
+            y = rect.top() + int(rect.height() * index / 4)
+            painter.drawLine(rect.left(), y, rect.right(), y)
+
+        self._draw_series(painter, rect, self.train_points, min_step, max_step, min_loss, max_loss, QColor("#f5b041"))
+        self._draw_series(painter, rect, self.val_points, min_step, max_step, min_loss, max_loss, QColor("#b6d77a"))
+        painter.setPen(QColor("#f5b041"))
+        painter.drawText(rect.left(), self.height() - 6, self.primary_label)
+        painter.setPen(QColor("#b6d77a"))
+        painter.drawText(rect.left() + 82, self.height() - 6, self.secondary_label)
+        painter.setPen(QColor("#cfcfcf"))
+        painter.drawText(rect.right() - 120, self.height() - 6, f"{min_loss:.3f} - {max_loss:.3f}")
+        painter.end()
+
+    def _draw_series(
+        self,
+        painter: QPainter,
+        rect: Any,
+        points: list[tuple[int, float]],
+        min_step: int,
+        max_step: int,
+        min_loss: float,
+        max_loss: float,
+        color: QColor,
+    ) -> None:
+        """Draw one line series.
+
+        Args:
+            painter: Active painter.
+            rect: Plot rectangle.
+            points: Step/loss pairs.
+            min_step: Minimum plotted step.
+            max_step: Maximum plotted step.
+            min_loss: Minimum plotted loss.
+            max_loss: Maximum plotted loss.
+            color: Series color.
+        """
+
+        if not points:
+            return
+        mapped = [
+            QPointF(
+                rect.left() + (step - min_step) / max(max_step - min_step, 1) * rect.width(),
+                rect.bottom() - (loss - min_loss) / max(max_loss - min_loss, 1e-9) * rect.height(),
+            )
+            for step, loss in points
+        ]
+        painter.setPen(QPen(color, 2))
+        for start, end in zip(mapped, mapped[1:]):
+            painter.drawLine(start, end)
+        painter.setBrush(QBrush(color))
+        for point in mapped[-8:]:
+            painter.drawEllipse(point, 2.5, 2.5)
 
 class MainWindow(QMainWindow):
     """Main PySide6 window for Micro LLM Creator."""
@@ -128,6 +283,9 @@ class MainWindow(QMainWindow):
         self.active_button_text = ""
         self.active_button_restore_text = ""
         self.current_project_file: Optional[Path] = None
+        self.training_cards: list[QWidget] = []
+        self.training_controls_grid: Optional[QGridLayout] = None
+        self.training_controls_columns = 3
         self.interrupt_count = 0
         self.chat_session: Optional[LlamaChatSession] = None
         self.chat_markdown = ""
@@ -170,7 +328,8 @@ class MainWindow(QMainWindow):
         top = QWidget()
         top.setObjectName("TopBar")
         top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(16, 10, 16, 10)
+        top_layout.setContentsMargins(16, 8, 16, 8)
+        top_layout.setSpacing(8)
         logo = QLabel("ML")
         logo.setObjectName("Logo")
         self.search_box = QLineEdit()
@@ -191,12 +350,16 @@ class MainWindow(QMainWindow):
         self.chat_status = QLabel("Chat: no GGUF loaded")
         for label in (self.dataset_status, self.train_status, self.export_status, self.chat_status):
             label.setObjectName("TopStatus")
-            label.setMaximumWidth(230)
+            label.setMinimumWidth(0)
+            label.setMaximumWidth(180)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             label.setWordWrap(False)
         self.project_state = QLabel("Ready")
         self.project_state.setObjectName("Metric")
+        self.project_state.setMinimumWidth(0)
+        self.project_state.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         top_layout.addWidget(logo)
-        top_layout.addSpacing(18)
+        top_layout.addSpacing(12)
         top_layout.addWidget(self.search_box)
         top_layout.addWidget(self.save_project_button)
         top_layout.addWidget(self.open_project_button)
@@ -214,25 +377,29 @@ class MainWindow(QMainWindow):
         body.setSpacing(0)
         rail = QWidget()
         rail.setObjectName("SideRail")
-        rail.setFixedWidth(72)
+        rail.setFixedWidth(82)
         rail_layout = QVBoxLayout(rail)
-        rail_layout.setContentsMargins(12, 22, 12, 22)
-        rail_layout.setSpacing(14)
-        self.dataset_nav = self._nav_button("IN")
-        self.training_nav = self._nav_button("AI")
-        self.export_nav = self._nav_button("X")
-        self.chat_nav = self._nav_button("Chat")
+        rail_layout.setContentsMargins(12, 18, 12, 18)
+        rail_layout.setSpacing(12)
+        self.dataset_nav = self._nav_button("⇩\nIN")
+        self.training_nav = self._nav_button("✦\nAI")
+        self.benchmark_nav = self._nav_button("◷\nBench")
+        self.export_nav = self._nav_button("⇧\nX")
+        self.chat_nav = self._nav_button("◌\nChat")
         self._tip(self.dataset_nav, "Open dataset preparation: load text/PDF files and build tokenizer data.")
         self._tip(self.training_nav, "Open model training: configure architecture and optimization settings.")
+        self._tip(self.benchmark_nav, "Open benchmark prompts: test checkpoint quality with repeatable prompts.")
         self._tip(self.export_nav, "Open export tools: bundle or quantize the trained model artifacts.")
         self._tip(self.chat_nav, "Open Chat: load a GGUF model once and send prompts.")
         self.dataset_nav.setChecked(True)
         self.dataset_nav.clicked.connect(lambda: self._switch_page(0))
         self.training_nav.clicked.connect(lambda: self._switch_page(1))
-        self.export_nav.clicked.connect(lambda: self._switch_page(2))
-        self.chat_nav.clicked.connect(lambda: self._switch_page(3))
+        self.benchmark_nav.clicked.connect(lambda: self._switch_page(2))
+        self.export_nav.clicked.connect(lambda: self._switch_page(3))
+        self.chat_nav.clicked.connect(lambda: self._switch_page(4))
         rail_layout.addWidget(self.dataset_nav)
         rail_layout.addWidget(self.training_nav)
+        rail_layout.addWidget(self.benchmark_nav)
         rail_layout.addWidget(self.export_nav)
         rail_layout.addWidget(self.chat_nav)
         rail_layout.addStretch(1)
@@ -240,6 +407,7 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_dataset_tab())
         self.pages.addWidget(self._build_training_tab())
+        self.pages.addWidget(self._build_benchmark_tab())
         self.pages.addWidget(self._build_export_tab())
         self.pages.addWidget(self._build_chat_tab())
 
@@ -271,9 +439,53 @@ class MainWindow(QMainWindow):
         """
 
         self.pages.setCurrentIndex(index)
-        buttons = [self.dataset_nav, self.training_nav, self.export_nav, self.chat_nav]
+        buttons = [self.dataset_nav, self.training_nav, self.benchmark_nav, self.export_nav, self.chat_nav]
         for button_index, button in enumerate(buttons):
             button.setChecked(button_index == index)
+        self._refresh_training_layout()
+
+    def resizeEvent(self, event: Any) -> None:
+        """Refresh responsive layouts when the main window changes size.
+
+        Args:
+            event: Qt resize event.
+        """
+
+        super().resizeEvent(event)
+        self._refresh_training_layout()
+
+    def _refresh_training_layout(self) -> None:
+        """Apply responsive card columns on the training page."""
+
+        if not self.training_cards or self.training_controls_grid is None:
+            return
+        width = self.pages.width() if hasattr(self, "pages") else self.width()
+        if width >= 900:
+            columns = 2
+        else:
+            columns = 1
+        if columns == self.training_controls_columns:
+            return
+        self._set_training_card_columns(columns)
+
+    def _set_training_card_columns(self, columns: int) -> None:
+        """Reflow the training cards into the requested column count.
+
+        Args:
+            columns: Number of columns to use.
+        """
+
+        if self.training_controls_grid is None:
+            return
+        while self.training_controls_grid.count():
+            self.training_controls_grid.takeAt(0)
+        for index, card in enumerate(self.training_cards):
+            row = index // columns
+            column = index % columns
+            self.training_controls_grid.addWidget(card, row, column)
+        for column in range(2):
+            self.training_controls_grid.setColumnStretch(column, 1 if column < columns else 0)
+        self.training_controls_columns = columns
 
     def _build_dataset_tab(self) -> QWidget:
         """Build the dataset preparation page.
@@ -283,9 +495,20 @@ class MainWindow(QMainWindow):
         """
 
         page = self._panel()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 24, 24, 14)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("Panel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 10)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         title = self._page_title("Data Ingestion Matrix")
         layout.addWidget(title)
 
@@ -399,6 +622,27 @@ class MainWindow(QMainWindow):
         module_grid.setColumnStretch(1, 1)
         layout.addLayout(module_grid)
 
+        quality_grid = QGridLayout()
+        quality_grid.setHorizontalSpacing(8)
+        quality_grid.setVerticalSpacing(8)
+        self.dataset_quality_samples = self._metric_chip("Samples: -", "Training samples after PDF/text/code expansion.")
+        self.dataset_quality_tokens = self._metric_chip("Tokens: -", "Total encoded tokens available for training.")
+        self.dataset_quality_vocab = self._metric_chip("Vocab: -", "Tokenizer vocabulary size used by the dataset.")
+        self.dataset_quality_code = self._metric_chip("Code/prose: -", "Code and prose sample split.")
+        self.dataset_quality_cache = self._metric_chip("Cache: -", "Files reused from cache versus processed this run.")
+        self.dataset_quality_warning = self._metric_chip("Warnings: none", "Dataset quality warnings, if any.")
+        quality_items = [
+            self.dataset_quality_samples,
+            self.dataset_quality_tokens,
+            self.dataset_quality_vocab,
+            self.dataset_quality_code,
+            self.dataset_quality_cache,
+            self.dataset_quality_warning,
+        ]
+        for index, item in enumerate(quality_items):
+            quality_grid.addWidget(item, index // 3, index % 3)
+        layout.addWidget(self._card("DATASET QUALITY", quality_grid), 0)
+
         self.prepare_button = QPushButton("Prepare Dataset")
         self._tip(self.prepare_button, "Read source files, clean text, train tokenizer, split tokens, and save the dataset project.")
         self.prepare_button.clicked.connect(self.prepare_dataset)
@@ -411,9 +655,10 @@ class MainWindow(QMainWindow):
 
         self.dataset_log = QTextEdit()
         self.dataset_log.setReadOnly(True)
+        self.dataset_log.setMaximumHeight(140)
         log_layout = QVBoxLayout()
         log_layout.addWidget(self.dataset_log)
-        layout.addWidget(self._card("INGEST TELEMETRY", log_layout), 1)
+        layout.addWidget(self._card("INGEST TELEMETRY", log_layout), 0)
         action_row = QHBoxLayout()
         action_row.addWidget(self.prepare_button)
         action_row.addWidget(self.stop_dataset_button)
@@ -421,7 +666,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(action_row)
 
         self.dataset_progress = self._thin_progress()
-        layout.addWidget(self.dataset_progress)
+        outer.addWidget(self.dataset_progress)
         return page
 
     def _build_training_tab(self) -> QWidget:
@@ -432,14 +677,34 @@ class MainWindow(QMainWindow):
         """
 
         page = self._panel()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 24, 24, 14)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("Panel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 10)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         layout.addWidget(self._page_title("Neural Forge"))
+        training_body = QHBoxLayout()
+        training_body.setSpacing(12)
+        left_zone = QVBoxLayout()
+        left_zone.setSpacing(10)
+        right_zone = QVBoxLayout()
+        right_zone.setSpacing(10)
+        training_body.addLayout(left_zone, 2)
+        training_body.addLayout(right_zone, 1)
+        layout.addLayout(training_body, 1)
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
 
         left = QFormLayout()
         self._configure_form(left)
@@ -469,8 +734,8 @@ class MainWindow(QMainWindow):
         self._tip(self.train_context_length, "Training context length in tokens. Must fit your GPU/CPU memory.")
         self.dropout = self._double_spin(0.0, 0.9, 0.1, 0.01, 3)
         self._tip(self.dropout, "Dropout regularization. Higher values reduce overfitting but can slow learning.")
-        left.addRow("Dataset project", self._path_row(self.train_data_dir, directory=True))
-        left.addRow("Model output", self._path_row(self.model_dir, directory=True))
+        left.addRow("Dataset", self._path_row(self.train_data_dir, directory=True))
+        left.addRow("Model", self._path_row(self.model_dir, directory=True))
         left.addRow("Preset", self.preset)
         left.addRow("Block style", self.architecture_style)
         left.addRow("n_embd", self.n_embd)
@@ -507,15 +772,15 @@ class MainWindow(QMainWindow):
         self.device_info = QLabel()
         self.device_info.setObjectName("Metric")
         self.device_info.setWordWrap(True)
-        self.device_info.setMaximumWidth(360)
+        self.device_info.setMaximumWidth(260)
         self._configure_device_options()
-        self.use_amp = QCheckBox("Use mixed precision on CUDA")
+        self.use_amp = QCheckBox("Mixed precision")
         self.use_amp.setChecked(self.use_amp_default)
         self._tip(self.use_amp, "Use mixed precision on CUDA. Usually faster and lighter on GPU memory.")
-        self.resume_training = QCheckBox("Resume from latest checkpoint")
+        self.resume_training = QCheckBox("Resume latest")
         self.resume_training.setChecked(True)
         self._tip(self.resume_training, "Continue from the latest checkpoint if training was interrupted.")
-        self.resume_safety = QCheckBox("Require compatible resume")
+        self.resume_safety = QCheckBox("Safe resume")
         self.resume_safety.setChecked(True)
         self._tip(
             self.resume_safety,
@@ -524,14 +789,14 @@ class MainWindow(QMainWindow):
         self.resume_checkpoint = QLineEdit()
         self._tip(self.resume_checkpoint, "Optional specific checkpoint file to resume from instead of the latest checkpoint.")
         right.addRow("Epochs", self.epochs)
-        right.addRow("Batch size", self.batch_size)
-        right.addRow("Learning rate", self.learning_rate)
-        right.addRow("Weight decay", self.weight_decay)
-        right.addRow("Gradient accumulation", self.gradient_accumulation)
-        right.addRow("Warmup steps", self.warmup_steps)
-        right.addRow("Eval interval", self.eval_interval)
-        right.addRow("Save interval", self.save_interval)
-        right.addRow("Max grad norm", self.max_grad_norm)
+        right.addRow("Batch", self.batch_size)
+        right.addRow("LR", self.learning_rate)
+        right.addRow("Decay", self.weight_decay)
+        right.addRow("Grad accum", self.gradient_accumulation)
+        right.addRow("Warmup", self.warmup_steps)
+        right.addRow("Eval every", self.eval_interval)
+        right.addRow("Save every", self.save_interval)
+        right.addRow("Max grad", self.max_grad_norm)
         right.addRow("Seed", self.seed)
         runtime = QFormLayout()
         self._configure_form(runtime)
@@ -540,18 +805,26 @@ class MainWindow(QMainWindow):
         runtime.addRow("", self.use_amp)
         runtime.addRow("", self.resume_training)
         runtime.addRow("", self.resume_safety)
-        runtime.addRow("Resume checkpoint", self._path_row(self.resume_checkpoint, directory=False))
+        runtime.addRow("Checkpoint", self._path_row(self.resume_checkpoint, directory=False))
 
-        grid.addWidget(self._card("MODEL ARCHITECTURE", left), 0, 0)
-        grid.addWidget(self._card("OPTIMIZATION ENGINE", right), 0, 1)
-        grid.addWidget(self._card("RUNTIME CONTROL", runtime), 0, 2)
-        grid.setColumnStretch(0, 0)
-        grid.setColumnStretch(1, 0)
-        grid.setColumnStretch(2, 0)
+        self.training_cards = [
+            self._card("MODEL ARCHITECTURE", left),
+            self._card("OPTIMIZATION ENGINE", right),
+        ]
+        for card in self.training_cards:
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        for index, card in enumerate(self.training_cards):
+            grid.addWidget(card, 0, index)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        self.training_controls_grid = grid
+        self.training_controls_columns = 2
         controls = QWidget()
-        controls.setMaximumWidth(1380)
         controls.setLayout(grid)
-        layout.addWidget(controls, 0, Qt.AlignLeft | Qt.AlignTop)
+        controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self.training_controls = controls
+        left_zone.addWidget(controls, 0)
+        right_zone.addWidget(self._card("RUNTIME CONTROL", runtime), 0)
 
         self.train_button = QPushButton("Start Training")
         self._tip(self.train_button, "Start or resume training using the selected model and optimizer settings.")
@@ -563,38 +836,63 @@ class MainWindow(QMainWindow):
         self.stop_training_button.clicked.connect(self.stop_active_task)
         self._tip(self.stop_training_button, "Request a graceful stop and save a resumable checkpoint.")
 
+        metrics_grid = QGridLayout()
+        metrics_grid.setHorizontalSpacing(8)
+        metrics_grid.setVerticalSpacing(8)
+        self.training_epoch_metric = self._metric_chip("Epoch: -", "Current epoch and total epochs.")
+        self.training_step_metric = self._metric_chip("Step: -", "Current optimizer step and total planned steps.")
+        self.training_loss_metric = self._metric_chip("Train loss: -", "Latest training loss. Lower is usually better.")
+        self.training_val_metric = self._metric_chip("Val loss: -", "Latest validation loss when validation is enabled.")
+        self.training_lr_metric = self._metric_chip("LR: -", "Current learning rate from the scheduler.")
+        self.training_speed_metric = self._metric_chip("Speed: -", "Current training throughput.")
+        self.training_grad_metric = self._metric_chip("Grad: -", "Current gradient norm.")
+        self.training_vram_metric = self._metric_chip("VRAM: -", "Current CUDA memory usage when training on GPU.")
+        self.training_eta_metric = self._metric_chip("ETA: -", "Estimated time remaining based on recent optimizer steps.")
+        for index, metric in enumerate((
+            self.training_eta_metric,
+            self.training_epoch_metric,
+            self.training_step_metric,
+            self.training_loss_metric,
+            self.training_val_metric,
+            self.training_lr_metric,
+            self.training_speed_metric,
+            self.training_grad_metric,
+            self.training_vram_metric,
+        )):
+            metrics_grid.addWidget(metric, index, 0)
+        metrics_layout = QVBoxLayout()
+        metrics_layout.setSpacing(8)
+        metrics_layout.addLayout(metrics_grid)
+        self.loss_chart = LossChartWidget()
+        self._tip(self.loss_chart, "Live training and validation loss. Falling values usually mean the model is learning.")
+        self.optimization_chart = LossChartWidget("LR", "Grad", "Learning rate and gradient norm will appear during training")
+        self._tip(self.optimization_chart, "Learning rate and gradient norm. Watch for unstable spikes or gradients collapsing toward zero.")
+        self.stability_chart = LossChartWidget("Weight", "Update", "Weight norm and update ratio will appear during training")
+        self._tip(self.stability_chart, "Weight norm and parameter update ratio. Large update ratios can destabilize training; tiny ratios can stall learning.")
+        self.throughput_chart = LossChartWidget("Tok/s", "Samples/s", "Throughput will appear during training")
+        self._tip(self.throughput_chart, "Training speed measured as tokens/sec and samples/sec.")
+        self.memory_chart = LossChartWidget("VRAM alloc", "VRAM reserved", "VRAM usage will appear during CUDA training")
+        self._tip(self.memory_chart, "CUDA memory usage in GB. Helps diagnose memory bottlenecks.")
+        charts_grid = QGridLayout()
+        charts_grid.setHorizontalSpacing(8)
+        charts_grid.setVerticalSpacing(8)
+        charts_grid.addWidget(self.loss_chart, 0, 0)
+        charts_grid.addWidget(self.optimization_chart, 0, 1)
+        charts_grid.addWidget(self.stability_chart, 1, 0)
+        charts_grid.addWidget(self.throughput_chart, 1, 1)
+        charts_grid.addWidget(self.memory_chart, 2, 0, 1, 2)
+        charts_grid.setColumnStretch(0, 1)
+        charts_grid.setColumnStretch(1, 1)
+        left_zone.addWidget(self._card("TRAINING GRAPHS", charts_grid), 1)
+        right_zone.addWidget(self._card("TRAINING METRICS", metrics_layout), 0)
+
         self.training_log = QTextEdit()
         self.training_log.setReadOnly(True)
+        self.training_log.setMinimumHeight(320)
+        self.training_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         telemetry_layout = QVBoxLayout()
-        telemetry_layout.addWidget(self.training_log)
-        layout.addWidget(self._card("TRAINING TELEMETRY", telemetry_layout), 1)
-
-        benchmark_grid = QGridLayout()
-        benchmark_grid.setHorizontalSpacing(12)
-        benchmark_grid.setVerticalSpacing(8)
-        self.benchmark_prompts = QTextEdit()
-        self.benchmark_prompts.setMaximumHeight(110)
-        self.benchmark_prompts.setPlainText("\n\n".join(DEFAULT_BENCHMARK_PROMPTS))
-        self._tip(self.benchmark_prompts, "Benchmark prompts separated by blank lines. Run the same prompts after each training run.")
-        self.benchmark_tokens = self._spin(16, 1024, 128)
-        self._tip(self.benchmark_tokens, "Maximum generated tokens per benchmark prompt.")
-        self.benchmark_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
-        self._tip(self.benchmark_temperature, "Sampling randomness for benchmark generation.")
-        self.benchmark_kv_cache = QCheckBox("Use KV cache")
-        self.benchmark_kv_cache.setChecked(True)
-        self._tip(self.benchmark_kv_cache, "Reuse attention key/value tensors during MicroGPT benchmark generation for faster inference.")
-        self.run_benchmark_button = QPushButton("Run Benchmark")
-        self.run_benchmark_button.setMaximumWidth(180)
-        self.run_benchmark_button.clicked.connect(self.run_benchmark)
-        self._tip(self.run_benchmark_button, "Generate benchmark outputs from final_model.pt and save a benchmark JSON file.")
-        benchmark_grid.addWidget(self.benchmark_prompts, 0, 0, 3, 1)
-        benchmark_grid.addWidget(QLabel("Max tokens"), 0, 1)
-        benchmark_grid.addWidget(self.benchmark_tokens, 0, 2)
-        benchmark_grid.addWidget(QLabel("Temperature"), 1, 1)
-        benchmark_grid.addWidget(self.benchmark_temperature, 1, 2)
-        benchmark_grid.addWidget(self.benchmark_kv_cache, 2, 1, 1, 2)
-        benchmark_grid.addWidget(self.run_benchmark_button, 3, 1, 1, 2)
-        layout.addWidget(self._card("BENCHMARK PROMPTS", benchmark_grid), 0)
+        telemetry_layout.addWidget(self.training_log, 1)
+        right_zone.addWidget(self._card("TRAINING TELEMETRY", telemetry_layout), 1)
 
         action_row = QHBoxLayout()
         action_row.addWidget(self.train_button)
@@ -603,7 +901,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(action_row)
 
         self.training_progress = self._thin_progress()
-        layout.addWidget(self.training_progress)
+        outer.addWidget(self.training_progress)
+        QTimer.singleShot(0, self._refresh_training_layout)
         return page
 
     def _build_export_tab(self) -> QWidget:
@@ -614,9 +913,20 @@ class MainWindow(QMainWindow):
         """
 
         page = self._panel()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 24, 24, 14)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("Panel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 10)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         layout.addWidget(self._page_title("Export Bay"))
 
         form = QFormLayout()
@@ -671,6 +981,8 @@ class MainWindow(QMainWindow):
 
         self.export_log = QTextEdit()
         self.export_log.setReadOnly(True)
+        self.export_log.setMinimumHeight(320)
+        self.export_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.export_log.setPlainText(
             "Export options:\n"
             "- Bundle copies final_model.pt, tokenizer.json, and training_summary.json.\n"
@@ -680,12 +992,82 @@ class MainWindow(QMainWindow):
             "- Native MicroGPT checkpoints are not written as fake GGUF files.\n"
         )
         export_log_layout = QVBoxLayout()
-        export_log_layout.addWidget(self.export_log)
+        export_log_layout.addWidget(self.export_log, 1)
         layout.addWidget(self._card("EXPORT TELEMETRY", export_log_layout), 1)
         layout.addLayout(row)
 
         self.export_progress = self._thin_progress()
-        layout.addWidget(self.export_progress)
+        outer.addWidget(self.export_progress)
+        return page
+
+    def _build_benchmark_tab(self) -> QWidget:
+        """Build the benchmark prompt page.
+
+        Returns:
+            Benchmark page widget.
+        """
+
+        page = self._panel()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("Panel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 10)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        layout.addWidget(self._page_title("Benchmark Console"))
+
+        benchmark_grid = QGridLayout()
+        benchmark_grid.setHorizontalSpacing(12)
+        benchmark_grid.setVerticalSpacing(8)
+        self.benchmark_prompts = QTextEdit()
+        self.benchmark_prompts.setMinimumHeight(260)
+        self.benchmark_prompts.setPlainText("\n\n".join(DEFAULT_BENCHMARK_PROMPTS))
+        self._tip(self.benchmark_prompts, "Benchmark prompts separated by blank lines. Run the same prompts after each training run.")
+        self.benchmark_tokens = self._spin(16, 1024, 128)
+        self._tip(self.benchmark_tokens, "Maximum generated tokens per benchmark prompt.")
+        self.benchmark_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
+        self._tip(self.benchmark_temperature, "Sampling randomness for benchmark generation.")
+        self.benchmark_kv_cache = QCheckBox("Use KV cache")
+        self.benchmark_kv_cache.setChecked(True)
+        self._tip(self.benchmark_kv_cache, "Reuse attention key/value tensors during MicroGPT benchmark generation for faster inference.")
+        self.run_benchmark_button = QPushButton("Run Benchmark")
+        self.run_benchmark_button.setMaximumWidth(180)
+        self.run_benchmark_button.clicked.connect(self.run_benchmark)
+        self._tip(self.run_benchmark_button, "Generate benchmark outputs from final_model.pt and save a benchmark JSON file.")
+        self.stop_benchmark_button = QPushButton("Stop")
+        self.stop_benchmark_button.setMaximumWidth(120)
+        self.stop_benchmark_button.setEnabled(False)
+        self.stop_benchmark_button.clicked.connect(self.stop_active_task)
+        self._tip(self.stop_benchmark_button, "Request a graceful stop for benchmark generation.")
+        benchmark_grid.addWidget(self.benchmark_prompts, 0, 0, 5, 1)
+        benchmark_grid.addWidget(QLabel("Max tokens"), 0, 1)
+        benchmark_grid.addWidget(self.benchmark_tokens, 0, 2)
+        benchmark_grid.addWidget(QLabel("Temperature"), 1, 1)
+        benchmark_grid.addWidget(self.benchmark_temperature, 1, 2)
+        benchmark_grid.addWidget(self.benchmark_kv_cache, 2, 1, 1, 2)
+        benchmark_grid.addWidget(self.run_benchmark_button, 3, 1, 1, 2)
+        benchmark_grid.addWidget(self.stop_benchmark_button, 4, 1, 1, 2)
+        benchmark_grid.setColumnStretch(0, 1)
+        layout.addWidget(self._card("BENCHMARK PROMPTS", benchmark_grid), 0)
+
+        self.benchmark_log = QTextEdit()
+        self.benchmark_log.setReadOnly(True)
+        self.benchmark_log.setMinimumHeight(260)
+        self.benchmark_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        benchmark_log_layout = QVBoxLayout()
+        benchmark_log_layout.addWidget(self.benchmark_log, 1)
+        layout.addWidget(self._card("BENCHMARK TELEMETRY", benchmark_log_layout), 1)
+
+        self.benchmark_progress = self._thin_progress()
+        outer.addWidget(self.benchmark_progress)
         return page
 
     def _build_chat_tab(self) -> QWidget:
@@ -786,10 +1168,14 @@ class MainWindow(QMainWindow):
 
         sample_form = QFormLayout()
         self._configure_form(sample_form)
+        self.thinking_enabled = QCheckBox("Thinking")
+        self.thinking_enabled.setChecked(True)
+        self._tip(self.thinking_enabled, "When enabled, the prompt asks the model to reason according to the selected effort level. Turn off for direct answers.")
         self.reasoning_effort = QComboBox()
         self.reasoning_effort.addItems(["Balanced", "Fast", "Deep"])
         self.reasoning_effort.setMaximumWidth(260)
         self._tip(self.reasoning_effort, "Controls the instruction style sent with each prompt. Deep asks for more careful reasoning.")
+        self.thinking_enabled.toggled.connect(self.reasoning_effort.setEnabled)
         self.chat_max_tokens = self._spin(16, 8192, 512)
         self._tip(self.chat_max_tokens, "Maximum new tokens for each assistant reply.")
         self.chat_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
@@ -798,6 +1184,7 @@ class MainWindow(QMainWindow):
         self._tip(self.chat_top_p, "Nucleus sampling. Lower values restrict the model to more likely tokens.")
         self.chat_repeat_penalty = self._double_spin(0.8, 2.0, 1.1, 0.01, 2)
         self._tip(self.chat_repeat_penalty, "Penalty for repeated text. Higher can reduce loops.")
+        sample_form.addRow("", self.thinking_enabled)
         sample_form.addRow("Reasoning effort", self.reasoning_effort)
         sample_form.addRow("Max tokens", self.chat_max_tokens)
         sample_form.addRow("Temperature", self.chat_temperature)
@@ -850,6 +1237,61 @@ class MainWindow(QMainWindow):
         label.setObjectName("PageTitle")
         return label
 
+    def _metric_chip(self, text: str, tooltip: str) -> QLabel:
+        """Create a compact metric display label.
+
+        Args:
+            text: Initial metric text.
+            tooltip: User-facing explanation.
+
+        Returns:
+            Configured metric label.
+        """
+
+        label = QLabel(text)
+        label.setObjectName("MetricChip")
+        label.setMinimumWidth(150)
+        label.setMinimumHeight(28)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tip(label, tooltip)
+        return label
+
+    def _update_dataset_quality_report(self, summary: dict[str, Any]) -> None:
+        """Update dataset quality chips from a summary dictionary.
+
+        Args:
+            summary: Dataset summary fields.
+        """
+
+        document_count = int(summary.get("document_count", 0) or 0)
+        token_count = int(summary.get("token_count", 0) or 0)
+        character_count = int(summary.get("character_count", 0) or 0)
+        vocab_size = int(summary.get("tokenizer_vocab_size", summary.get("vocab_size", 0)) or 0)
+        code_count = int(summary.get("code_sample_count", 0) or 0)
+        prose_count = int(summary.get("prose_sample_count", 0) or 0)
+        cached_count = int(summary.get("cached_file_count", 0) or 0)
+        processed_count = int(summary.get("processed_file_count", 0) or 0)
+        skipped_count = int(summary.get("skipped_file_count", 0) or 0)
+        failed_count = int(summary.get("failed_file_count", 0) or 0)
+        warning = str(summary.get("warning") or "none")
+        self.dataset_quality_samples.setText(f"Samples: {document_count:,}")
+        self.dataset_quality_tokens.setText(f"Tokens: {token_count:,}")
+        self.dataset_quality_vocab.setText(f"Vocab: {vocab_size:,}" if vocab_size else "Vocab: -")
+        self.dataset_quality_code.setText(f"Code/prose: {code_count:,}/{prose_count:,}")
+        self.dataset_quality_cache.setText(f"Files: {processed_count:,} ok, {cached_count:,} cached, {skipped_count:,} skipped, {failed_count:,} failed")
+        self.dataset_quality_warning.setText(f"Warnings: {warning}")
+        self._tip(self.dataset_quality_samples, f"{character_count:,} source characters across prepared samples.")
+
+    def _reset_dataset_quality_report(self) -> None:
+        """Reset dataset quality chips to their empty state."""
+
+        self.dataset_quality_samples.setText("Samples: -")
+        self.dataset_quality_tokens.setText("Tokens: -")
+        self.dataset_quality_vocab.setText("Vocab: -")
+        self.dataset_quality_code.setText("Code/prose: -")
+        self.dataset_quality_cache.setText("Cache: -")
+        self.dataset_quality_warning.setText("Warnings: none")
+
     def _card(self, title: str, content_layout: Union[QVBoxLayout, QFormLayout, QGridLayout, QHBoxLayout]) -> QWidget:
         """Create a neon module card.
 
@@ -864,8 +1306,8 @@ class MainWindow(QMainWindow):
         card = QWidget()
         card.setObjectName("Card")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
         title_label = QLabel(title)
         title_label.setObjectName("SectionLabel")
         layout.addWidget(title_label)
@@ -887,7 +1329,7 @@ class MainWindow(QMainWindow):
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
-        spin.setMaximumWidth(260)
+        spin.setMaximumWidth(220)
         return spin
 
     def _double_spin(self, minimum: float, maximum: float, value: float, step: float, decimals: int) -> QDoubleSpinBox:
@@ -909,7 +1351,7 @@ class MainWindow(QMainWindow):
         spin.setDecimals(decimals)
         spin.setSingleStep(step)
         spin.setValue(value)
-        spin.setMaximumWidth(260)
+        spin.setMaximumWidth(220)
         return spin
 
     def _path_row(self, field: QLineEdit, directory: bool = True, file_filter: str = "Checkpoints (*.pt)") -> QWidget:
@@ -925,15 +1367,15 @@ class MainWindow(QMainWindow):
         """
 
         row = QWidget()
-        row.setMaximumWidth(680)
+        row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         browse = QPushButton("Browse")
         browse.setFixedWidth(88)
         self._tip(browse, "Open a file/folder picker for this path.")
-        field.setMinimumWidth(260)
-        field.setMaximumWidth(560)
+        field.setMinimumWidth(180)
+        field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         browse.clicked.connect(lambda: self._browse(field, directory, file_filter))
         layout.addWidget(field, 1)
         layout.addWidget(browse)
@@ -948,9 +1390,9 @@ class MainWindow(QMainWindow):
 
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(9)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(7)
 
     def _configure_device_options(self) -> None:
         """Populate training device choices without duplicate CPU entries."""
@@ -1739,6 +2181,7 @@ class MainWindow(QMainWindow):
                 "context": self.llama_context.value(),
                 "cpu_threads": self.llama_threads.value(),
                 "gpu_layers": self.llama_gpu_layers.value(),
+                "thinking_enabled": self.thinking_enabled.isChecked(),
                 "reasoning_effort": self.reasoning_effort.currentText(),
                 "max_tokens": self.chat_max_tokens.value(),
                 "temperature": self.chat_temperature.value(),
@@ -1840,7 +2283,9 @@ class MainWindow(QMainWindow):
         self.llama_context.setValue(int(chat.get("context", self.llama_context.value())))
         self.llama_threads.setValue(int(chat.get("cpu_threads", self.llama_threads.value())))
         self.llama_gpu_layers.setValue(int(chat.get("gpu_layers", self.llama_gpu_layers.value())))
+        self.thinking_enabled.setChecked(bool(chat.get("thinking_enabled", True)))
         self._set_combo_text(self.reasoning_effort, str(chat.get("reasoning_effort", self.reasoning_effort.currentText())))
+        self.reasoning_effort.setEnabled(self.thinking_enabled.isChecked())
         self.chat_max_tokens.setValue(int(chat.get("max_tokens", self.chat_max_tokens.value())))
         self.chat_temperature.setValue(float(chat.get("temperature", self.chat_temperature.value())))
         self.chat_top_p.setValue(float(chat.get("top_p", self.chat_top_p.value())))
@@ -1864,6 +2309,7 @@ class MainWindow(QMainWindow):
             code_count = int(summary.get("code_sample_count", 0) or 0)
             prose_count = int(summary.get("prose_sample_count", 0) or 0)
             vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
+            self._update_dataset_quality_report(summary)
             self.prepare_button.setText("DataSet Prepared")
             self.dataset_progress.setValue(100)
             if vocab_size:
@@ -1884,6 +2330,7 @@ class MainWindow(QMainWindow):
             self.dataset_progress.setValue(0)
             self.dataset_status.setText("Dataset: not prepared")
             self.auto_vocab_label.setText("Auto after reading files")
+            self._reset_dataset_quality_report()
 
         model_dir = Path(self.model_dir.text()) if self.model_dir.text().strip() else None
         if model_dir and (model_dir / "final_model.pt").exists():
@@ -2081,12 +2528,85 @@ class MainWindow(QMainWindow):
                 return
             message = event.get("message")
             percent = event.get("percent")
+            if log is self.training_log:
+                self._update_training_metrics(event)
             if message:
                 log.append(str(message))
             if percent is not None:
                 progress_bar.setValue(max(0, min(100, int(percent))))
         else:
             log.append(str(event))
+
+    def _update_training_metrics(self, event: dict[str, Any]) -> None:
+        """Update training metric chips from a progress event.
+
+        Args:
+            event: Progress event emitted by the training backend.
+        """
+
+        if "epoch" in event and "total_epochs" in event:
+            self.training_epoch_metric.setText(f"Epoch: {event['epoch']}/{event['total_epochs']}")
+        if "step" in event and "total_steps" in event:
+            self.training_step_metric.setText(f"Step: {event['step']}/{event['total_steps']}")
+        train_loss = event.get("train_loss")
+        if train_loss is not None:
+            self.training_loss_metric.setText(f"Train loss: {float(train_loss):.4f}")
+        val_loss = event.get("val_loss")
+        if val_loss is not None:
+            self.training_val_metric.setText(f"Val loss: {float(val_loss):.4f}")
+        step = event.get("step")
+        if step is not None and (train_loss is not None or val_loss is not None):
+            self.loss_chart.add_metrics(int(step), train_loss, val_loss)
+        if step is None:
+            return
+        step_int = int(step)
+        learning_rate = event.get("learning_rate")
+        grad_norm = event.get("grad_norm")
+        weight_norm = event.get("weight_norm")
+        update_ratio = event.get("update_ratio")
+        tokens_per_second = event.get("tokens_per_second")
+        samples_per_second = event.get("samples_per_second")
+        vram_allocated = event.get("vram_allocated_gb")
+        vram_reserved = event.get("vram_reserved_gb")
+        eta_seconds = event.get("eta_seconds")
+        if learning_rate is not None:
+            self.training_lr_metric.setText(f"LR: {float(learning_rate):.2e}")
+        if grad_norm is not None:
+            self.training_grad_metric.setText(f"Grad: {float(grad_norm):.3f}")
+        if tokens_per_second is not None:
+            self.training_speed_metric.setText(f"Speed: {float(tokens_per_second):.0f} tok/s")
+        if vram_allocated is not None:
+            self.training_vram_metric.setText(f"VRAM: {float(vram_allocated):.2f} GB")
+        if eta_seconds is not None:
+            self.training_eta_metric.setText(f"ETA: {self._format_duration(float(eta_seconds))}")
+        if learning_rate is not None or grad_norm is not None:
+            self.optimization_chart.add_values(step_int, learning_rate, grad_norm)
+        if weight_norm is not None or update_ratio is not None:
+            self.stability_chart.add_values(step_int, weight_norm, update_ratio)
+        if tokens_per_second is not None or samples_per_second is not None:
+            self.throughput_chart.add_values(step_int, tokens_per_second, samples_per_second)
+        if vram_allocated is not None or vram_reserved is not None:
+            self.memory_chart.add_values(step_int, vram_allocated, vram_reserved)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Format a duration for compact UI display.
+
+        Args:
+            seconds: Duration in seconds.
+
+        Returns:
+            Human-readable compact duration.
+        """
+
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes}m {secs:02d}s"
+        return f"{secs}s"
 
     def _apply_chat_delta(self, event: dict[str, Any]) -> None:
         """Apply one streamed chat chunk to the rendered conversation.
@@ -2224,6 +2744,7 @@ class MainWindow(QMainWindow):
         )
         self.dataset_log.clear()
         self.dataset_progress.setValue(0)
+        self._reset_dataset_quality_report()
         self.dataset_log.append("Preparing dataset...")
         self.project_state.setText("Preparing dataset")
         self.dataset_status.setText("Dataset: preparing")
@@ -2261,6 +2782,21 @@ class MainWindow(QMainWindow):
             self.dataset_log.append(f"Dataset version: {result.dataset_version_id}")
         if result.warning:
             self.dataset_log.append(f"Recommendation: {result.warning}")
+        self._update_dataset_quality_report(
+            {
+                "document_count": result.document_count,
+                "token_count": result.token_count,
+                "character_count": result.character_count,
+                "tokenizer_vocab_size": result.vocab_size,
+                "code_sample_count": result.code_sample_count,
+                "prose_sample_count": result.prose_sample_count,
+                "cached_file_count": result.cached_file_count,
+                "processed_file_count": result.processed_file_count,
+                "skipped_file_count": result.skipped_file_count,
+                "failed_file_count": result.failed_file_count,
+                "warning": result.warning,
+            }
+        )
         self.train_data_dir.setText(str(result.output_dir))
         self.project_state.setText("Dataset ready")
         self.dataset_status.setText(f"Dataset: {result.document_count} files, {result.token_count:,} tokens")
@@ -2389,6 +2925,20 @@ class MainWindow(QMainWindow):
         )
         self.training_log.clear()
         self.training_progress.setValue(0)
+        self.training_epoch_metric.setText("Epoch: -")
+        self.training_step_metric.setText("Step: -")
+        self.training_loss_metric.setText("Train loss: -")
+        self.training_val_metric.setText("Val loss: -")
+        self.training_lr_metric.setText("LR: -")
+        self.training_speed_metric.setText("Speed: -")
+        self.training_grad_metric.setText("Grad: -")
+        self.training_vram_metric.setText("VRAM: -")
+        self.training_eta_metric.setText("ETA: -")
+        self.loss_chart.clear()
+        self.optimization_chart.clear()
+        self.stability_chart.clear()
+        self.throughput_chart.clear()
+        self.memory_chart.clear()
         self.training_log.append("Training started...")
         self.project_state.setText("Training")
         self.train_status.setText("Training: running")
@@ -2431,8 +2981,8 @@ class MainWindow(QMainWindow):
         """Run benchmark prompts against the current trained model."""
 
         prompts = normalize_prompts(self.benchmark_prompts.toPlainText())
-        self.training_log.append(f"Running benchmark with {len(prompts)} prompt(s)...")
-        self.training_progress.setValue(0)
+        self.benchmark_log.append(f"Running benchmark with {len(prompts)} prompt(s)...")
+        self.benchmark_progress.setValue(0)
         self.project_state.setText("Benchmarking")
         self._run_task(
             evaluate_checkpoint,
@@ -2447,11 +2997,11 @@ class MainWindow(QMainWindow):
                 self.benchmark_kv_cache.isChecked(),
             ),
             self._benchmark_finished,
-            self.training_log,
-            self.training_progress,
+            self.benchmark_log,
+            self.benchmark_progress,
             with_progress=True,
             button=self.run_benchmark_button,
-            stop_button=self.stop_training_button,
+            stop_button=self.stop_benchmark_button,
             busy_text="Benchmarking",
         )
 
@@ -2463,12 +3013,12 @@ class MainWindow(QMainWindow):
             result: Benchmark result object.
         """
 
-        self.training_progress.setRange(0, 100)
-        self.training_progress.setValue(100)
-        self.training_log.append(
+        self.benchmark_progress.setRange(0, 100)
+        self.benchmark_progress.setValue(100)
+        self.benchmark_log.append(
             f"Benchmark complete: {result.prompt_count} prompt(s), {result.total_seconds:.2f}s."
         )
-        self.training_log.append(f"Benchmark saved: {result.output_path}")
+        self.benchmark_log.append(f"Benchmark saved: {result.output_path}")
         self.project_state.setText("Benchmark complete")
         self._clear_button_busy("Run Benchmark")
 
@@ -2573,6 +3123,7 @@ class MainWindow(QMainWindow):
                 self.chat_top_p.value(),
                 self.chat_repeat_penalty.value(),
                 self.reasoning_effort.currentText(),
+                self.thinking_enabled.isChecked(),
             ),
             self._chat_reply_finished,
             self.chat_event_log,
