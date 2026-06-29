@@ -50,12 +50,16 @@ def prepare(args: argparse.Namespace) -> None:
         extract_code_blocks=not args.no_extract_code_blocks,
         preserve_indentation=not args.no_preserve_indentation,
         generate_instruction_samples=not args.no_instruction_samples,
+        prepare_mode=args.prepare_mode,
+        tokenizer_strategy=args.tokenizer_strategy,
+        tokenizer_path=Path(args.tokenizer_path) if args.tokenizer_path else None,
     )
     result = build_dataset(config, progress=print_progress)
     print(
         f"Documents: {result.document_count} | Characters: {result.character_count} | "
         f"Tokens: {result.token_count} | Vocab: {result.vocab_size}"
     )
+    print(f"Cache: reused {result.cached_file_count} file(s) | processed {result.processed_file_count} file(s)")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -132,6 +136,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--no_extract_code_blocks", action="store_true")
     prepare_parser.add_argument("--no_preserve_indentation", action="store_true")
     prepare_parser.add_argument("--no_instruction_samples", action="store_true")
+    prepare_parser.add_argument(
+        "--prepare_mode",
+        choices=["incremental", "full_rebuild", "force_reprocess"],
+        default="incremental",
+    )
+    prepare_parser.add_argument(
+        "--tokenizer_strategy",
+        choices=["auto", "train_new", "reuse_dataset", "import_tokenizer"],
+        default="auto",
+    )
+    prepare_parser.add_argument("--tokenizer_path", default=None)
     prepare_parser.set_defaults(func=prepare)
 
     train_parser = subparsers.add_parser("train", help="Train a MicroGPT model")

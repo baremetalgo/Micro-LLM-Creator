@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+from datetime import datetime
+import json
 from queue import Empty, Queue
 import re
 import sys
@@ -167,9 +169,17 @@ class MainWindow(QMainWindow):
         logo = QLabel("ML")
         logo.setObjectName("Logo")
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search project...")
-        self.search_box.setMaximumWidth(320)
-        self._tip(self.search_box, "Search across project paths and future saved presets. This does not affect training.")
+        self.search_box.setPlaceholderText("Project name...")
+        self.search_box.setMaximumWidth(260)
+        self._tip(self.search_box, "Project name used when saving or reopening a Micro LLM Creator project.")
+        self.save_project_button = QPushButton("Save Project")
+        self.save_project_button.setMaximumWidth(130)
+        self.save_project_button.clicked.connect(self.save_project)
+        self._tip(self.save_project_button, "Save all current paths and settings into a project.json file.")
+        self.open_project_button = QPushButton("Open Project")
+        self.open_project_button.setMaximumWidth(130)
+        self.open_project_button.clicked.connect(self.open_project)
+        self._tip(self.open_project_button, "Open a saved project.json file and restore the UI settings.")
         self.dataset_status = QLabel("Dataset: not prepared")
         self.train_status = QLabel("Training: idle")
         self.export_status = QLabel("Export: waiting")
@@ -183,6 +193,8 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(logo)
         top_layout.addSpacing(18)
         top_layout.addWidget(self.search_box)
+        top_layout.addWidget(self.save_project_button)
+        top_layout.addWidget(self.open_project_button)
         top_layout.addSpacing(10)
         top_layout.addWidget(self.dataset_status)
         top_layout.addWidget(self.train_status)
@@ -294,7 +306,7 @@ class MainWindow(QMainWindow):
         self.manual_vocab_size = self._spin(256, 100000, 8000)
         self.manual_vocab_size.setEnabled(False)
         self._tip(self.manual_vocab_size, "Manual tokenizer vocabulary size. Larger vocab can preserve more words but increases model output size.")
-        self.auto_vocab.toggled.connect(lambda checked: self.manual_vocab_size.setEnabled(not checked))
+        self.auto_vocab.toggled.connect(lambda checked: self.manual_vocab_size.setEnabled(not checked and not self._tokenizer_strategy_reuses()))
         self.auto_vocab_label = QLabel("Auto after reading files")
         self.auto_vocab_label.setObjectName("Metric")
         self._tip(self.auto_vocab_label, "The actual vocabulary size selected after reading the corpus.")
@@ -308,6 +320,24 @@ class MainWindow(QMainWindow):
         self._tip(self.lowercase, "Convert all text to lowercase. This shrinks vocabulary but removes capitalization patterns.")
         self.max_workers = self._spin(1, 64, 4)
         self._tip(self.max_workers, "Number of parallel file readers. More workers can speed PDF/text loading but uses more CPU and disk activity.")
+        self.prepare_mode = QComboBox()
+        self.prepare_mode.addItems(["Incremental update", "Full rebuild", "Force reprocess"])
+        self.prepare_mode.setMaximumWidth(260)
+        self._tip(
+            self.prepare_mode,
+            "Incremental update reuses cached extracted text and the existing tokenizer. Full rebuild rebuilds tokenizer/tokens. Force reprocess ignores cache.",
+        )
+        self.tokenizer_strategy = QComboBox()
+        self.tokenizer_strategy.addItems(["Auto", "Train new tokenizer", "Reuse dataset tokenizer", "Import tokenizer.json"])
+        self.tokenizer_strategy.setMaximumWidth(260)
+        self._tip(
+            self.tokenizer_strategy,
+            "Controls tokenizer reuse. Auto reuses the dataset tokenizer during incremental updates; Import lets you use a compatible tokenizer.json.",
+        )
+        self.tokenizer_path = QLineEdit()
+        self.tokenizer_path.setEnabled(False)
+        self._tip(self.tokenizer_path, "Existing tokenizer.json to import. Use this when continuing a compatible tokenizer family.")
+        self.tokenizer_strategy.currentTextChanged.connect(self._update_tokenizer_strategy_controls)
         self.code_training_mode = QCheckBox("Code Training Mode")
         self.code_training_mode.setChecked(True)
         self._tip(self.code_training_mode, "Prepare a programming dataset by preserving source code, tagging code/prose, and extracting code-like blocks.")
@@ -330,6 +360,7 @@ class MainWindow(QMainWindow):
         source_form.addRow("Source vault", self._path_row(self.input_dir, directory=True))
         source_form.addRow("Dataset core", self._path_row(self.dataset_dir, directory=True))
         source_form.addRow("Parallel lanes", self.max_workers)
+        source_form.addRow("Prepare mode", self.prepare_mode)
         source_form.addRow("", self.lowercase)
         source_form.addRow("", self.code_training_mode)
         source_form.addRow("", self.include_source_code)
@@ -337,6 +368,10 @@ class MainWindow(QMainWindow):
         tokenizer_form.addRow("Auto vocabulary", self.auto_vocab)
         tokenizer_form.addRow("Manual vocabulary", self.manual_vocab_size)
         tokenizer_form.addRow("Selected vocab", self.auto_vocab_label)
+        self.tokenizer_path_row = self._path_row(self.tokenizer_path, directory=False, file_filter="Tokenizer JSON (*.json);;All files (*)")
+        self.tokenizer_path_row.setEnabled(False)
+        tokenizer_form.addRow("Tokenizer policy", self.tokenizer_strategy)
+        tokenizer_form.addRow("Import tokenizer", self.tokenizer_path_row)
         tokenizer_form.addRow("Min frequency", self.min_frequency)
         tokenizer_form.addRow("Context window", self.context_length)
         tokenizer_form.addRow("Validation split", self.validation_split)
@@ -1471,6 +1506,267 @@ class MainWindow(QMainWindow):
         if value:
             field.setText(value)
 
+    def save_project(self) -> None:
+        """Save the current project settings into a named project folder."""
+
+        project_name = self.search_box.text().strip() or "MicroLLMProject"
+        safe_name = self._safe_project_name(project_name)
+        base_dir = QFileDialog.getExistingDirectory(self, "Choose parent folder for project", str(Path.cwd()))
+        if not base_dir:
+            return
+        project_dir = Path(base_dir) / safe_name
+        project_dir.mkdir(parents=True, exist_ok=True)
+        project_file = project_dir / "project.json"
+        project_file.write_text(json.dumps(self._project_state_dict(project_name, project_dir), indent=2), encoding="utf-8")
+        self.project_state.setText("Project saved")
+        QMessageBox.information(self, "Project saved", f"Project saved to:\n{project_file}")
+
+    def open_project(self) -> None:
+        """Open a saved project file and restore UI settings."""
+
+        project_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Micro LLM project",
+            str(Path.cwd()),
+            "Micro LLM project (project.json *.json);;All files (*)",
+        )
+        if not project_file:
+            return
+        try:
+            data = json.loads(Path(project_file).read_text(encoding="utf-8"))
+            self._apply_project_state(data)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open failed", f"Could not open project:\n{exc}")
+            return
+        self.project_state.setText("Project opened")
+        self.dataset_log.append(f"Opened project: {project_file}")
+
+    def _project_state_dict(self, project_name: str, project_dir: Path) -> dict[str, Any]:
+        """Collect all UI state that defines a Micro LLM project.
+
+        Args:
+            project_name: User-facing project name.
+            project_dir: Folder where the project file will live.
+
+        Returns:
+            JSON-serializable project state.
+        """
+
+        dataset_dir = Path(self.dataset_dir.text()) if self.dataset_dir.text().strip() else None
+        model_dir = Path(self.model_dir.text()) if self.model_dir.text().strip() else None
+        export_dir = Path(self.export_dir.text()) if self.export_dir.text().strip() else None
+        return {
+            "schema": "micro_llm_creator_project",
+            "version": 1,
+            "project_name": project_name,
+            "project_dir": str(project_dir),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "paths": {
+                "source_vault": self.input_dir.text(),
+                "dataset_core": self.dataset_dir.text(),
+                "training_dataset": self.train_data_dir.text(),
+                "model_output": self.model_dir.text(),
+                "export_model_core": self.export_model_dir.text(),
+                "export_output": self.export_dir.text(),
+                "gguf_model": self.gguf_path.text(),
+                "tokenizer_import": self.tokenizer_path.text(),
+                "resume_checkpoint": self.resume_checkpoint.text(),
+            },
+            "dataset": {
+                "auto_vocab": self.auto_vocab.isChecked(),
+                "manual_vocab_size": self.manual_vocab_size.value(),
+                "min_frequency": self.min_frequency.value(),
+                "context_length": self.context_length.value(),
+                "validation_split": self.validation_split.value(),
+                "lowercase": self.lowercase.isChecked(),
+                "max_workers": self.max_workers.value(),
+                "prepare_mode": self._prepare_mode_value(),
+                "tokenizer_strategy": self._tokenizer_strategy_value(),
+                "code_training_mode": self.code_training_mode.isChecked(),
+                "include_prose": self.include_prose.isChecked(),
+                "include_source_code": self.include_source_code.isChecked(),
+                "extract_code_blocks": self.extract_code_blocks.isChecked(),
+                "preserve_indentation": self.preserve_indentation.isChecked(),
+                "instruction_samples": self.instruction_samples.isChecked(),
+            },
+            "training": {
+                "preset": self.preset.currentText(),
+                "n_embd": self.n_embd.value(),
+                "n_head": self.n_head.value(),
+                "n_layer": self.n_layer.value(),
+                "context_length": self.train_context_length.value(),
+                "dropout": self.dropout.value(),
+                "epochs": self.epochs.value(),
+                "batch_size": self.batch_size.value(),
+                "learning_rate": self.learning_rate.value(),
+                "weight_decay": self.weight_decay.value(),
+                "gradient_accumulation": self.gradient_accumulation.value(),
+                "warmup_steps": self.warmup_steps.value(),
+                "eval_interval": self.eval_interval.value(),
+                "save_interval": self.save_interval.value(),
+                "max_grad_norm": self.max_grad_norm.value(),
+                "seed": self.seed.value(),
+                "device": self.device.currentText(),
+                "use_amp": self.use_amp.isChecked(),
+                "resume": self.resume_training.isChecked(),
+            },
+            "export": {
+                "quantization": self.quant_mode.currentText(),
+            },
+            "chat": {
+                "context": self.llama_context.value(),
+                "cpu_threads": self.llama_threads.value(),
+                "gpu_layers": self.llama_gpu_layers.value(),
+                "reasoning_effort": self.reasoning_effort.currentText(),
+                "max_tokens": self.chat_max_tokens.value(),
+                "temperature": self.chat_temperature.value(),
+                "top_p": self.chat_top_p.value(),
+                "repeat_penalty": self.chat_repeat_penalty.value(),
+                "system_prompt": self.system_prompt.toPlainText(),
+            },
+            "artifacts": {
+                "dataset_summary": self._read_json_if_exists(dataset_dir / "dataset_summary.json") if dataset_dir else None,
+                "training_summary": self._read_json_if_exists(model_dir / "training_summary.json") if model_dir else None,
+                "export_summary": self._read_json_if_exists(export_dir / "export_summary.json") if export_dir else None,
+            },
+        }
+
+    def _apply_project_state(self, data: dict[str, Any]) -> None:
+        """Restore UI state from a saved project dictionary.
+
+        Args:
+            data: Project state loaded from JSON.
+        """
+
+        self.search_box.setText(str(data.get("project_name", "")))
+        paths = data.get("paths", {})
+        dataset = data.get("dataset", {})
+        training = data.get("training", {})
+        export = data.get("export", {})
+        chat = data.get("chat", {})
+
+        self.input_dir.setText(str(paths.get("source_vault", "")))
+        self.dataset_dir.setText(str(paths.get("dataset_core", "")))
+        self.train_data_dir.setText(str(paths.get("training_dataset", "")))
+        self.model_dir.setText(str(paths.get("model_output", "")))
+        self.export_model_dir.setText(str(paths.get("export_model_core", "")))
+        self.export_dir.setText(str(paths.get("export_output", "")))
+        self.gguf_path.setText(str(paths.get("gguf_model", "")))
+        self.tokenizer_path.setText(str(paths.get("tokenizer_import", "")))
+        self.resume_checkpoint.setText(str(paths.get("resume_checkpoint", "")))
+
+        self.auto_vocab.setChecked(bool(dataset.get("auto_vocab", True)))
+        self.manual_vocab_size.setValue(int(dataset.get("manual_vocab_size", self.manual_vocab_size.value())))
+        self.min_frequency.setValue(int(dataset.get("min_frequency", self.min_frequency.value())))
+        self.context_length.setValue(int(dataset.get("context_length", self.context_length.value())))
+        self.validation_split.setValue(float(dataset.get("validation_split", self.validation_split.value())))
+        self.lowercase.setChecked(bool(dataset.get("lowercase", False)))
+        self.max_workers.setValue(int(dataset.get("max_workers", self.max_workers.value())))
+        self._set_combo_by_data(self.prepare_mode, str(dataset.get("prepare_mode", "incremental")), {
+            "incremental": "Incremental update",
+            "full_rebuild": "Full rebuild",
+            "force_reprocess": "Force reprocess",
+        })
+        self._set_combo_by_data(self.tokenizer_strategy, str(dataset.get("tokenizer_strategy", "auto")), {
+            "auto": "Auto",
+            "train_new": "Train new tokenizer",
+            "reuse_dataset": "Reuse dataset tokenizer",
+            "import_tokenizer": "Import tokenizer.json",
+        })
+        self.code_training_mode.setChecked(bool(dataset.get("code_training_mode", True)))
+        self.include_prose.setChecked(bool(dataset.get("include_prose", True)))
+        self.include_source_code.setChecked(bool(dataset.get("include_source_code", True)))
+        self.extract_code_blocks.setChecked(bool(dataset.get("extract_code_blocks", True)))
+        self.preserve_indentation.setChecked(bool(dataset.get("preserve_indentation", True)))
+        self.instruction_samples.setChecked(bool(dataset.get("instruction_samples", True)))
+
+        self._set_combo_text(self.preset, str(training.get("preset", self.preset.currentText())))
+        self.n_embd.setValue(int(training.get("n_embd", self.n_embd.value())))
+        self.n_head.setValue(int(training.get("n_head", self.n_head.value())))
+        self.n_layer.setValue(int(training.get("n_layer", self.n_layer.value())))
+        self.train_context_length.setValue(int(training.get("context_length", self.train_context_length.value())))
+        self.dropout.setValue(float(training.get("dropout", self.dropout.value())))
+        self.epochs.setValue(int(training.get("epochs", self.epochs.value())))
+        self.batch_size.setValue(int(training.get("batch_size", self.batch_size.value())))
+        self.learning_rate.setValue(float(training.get("learning_rate", self.learning_rate.value())))
+        self.weight_decay.setValue(float(training.get("weight_decay", self.weight_decay.value())))
+        self.gradient_accumulation.setValue(int(training.get("gradient_accumulation", self.gradient_accumulation.value())))
+        self.warmup_steps.setValue(int(training.get("warmup_steps", self.warmup_steps.value())))
+        self.eval_interval.setValue(int(training.get("eval_interval", self.eval_interval.value())))
+        self.save_interval.setValue(int(training.get("save_interval", self.save_interval.value())))
+        self.max_grad_norm.setValue(float(training.get("max_grad_norm", self.max_grad_norm.value())))
+        self.seed.setValue(int(training.get("seed", self.seed.value())))
+        self._set_combo_text(self.device, str(training.get("device", self.device.currentText())))
+        self.use_amp.setChecked(bool(training.get("use_amp", self.use_amp.isChecked())))
+        self.resume_training.setChecked(bool(training.get("resume", self.resume_training.isChecked())))
+
+        self._set_combo_text(self.quant_mode, str(export.get("quantization", self.quant_mode.currentText())))
+        self.llama_context.setValue(int(chat.get("context", self.llama_context.value())))
+        self.llama_threads.setValue(int(chat.get("cpu_threads", self.llama_threads.value())))
+        self.llama_gpu_layers.setValue(int(chat.get("gpu_layers", self.llama_gpu_layers.value())))
+        self._set_combo_text(self.reasoning_effort, str(chat.get("reasoning_effort", self.reasoning_effort.currentText())))
+        self.chat_max_tokens.setValue(int(chat.get("max_tokens", self.chat_max_tokens.value())))
+        self.chat_temperature.setValue(float(chat.get("temperature", self.chat_temperature.value())))
+        self.chat_top_p.setValue(float(chat.get("top_p", self.chat_top_p.value())))
+        self.chat_repeat_penalty.setValue(float(chat.get("repeat_penalty", self.chat_repeat_penalty.value())))
+        self.system_prompt.setPlainText(str(chat.get("system_prompt", "")))
+        self._update_tokenizer_strategy_controls()
+
+    @staticmethod
+    def _safe_project_name(project_name: str) -> str:
+        """Return a filesystem-safe project folder name.
+
+        Args:
+            project_name: Raw user project name.
+
+        Returns:
+            Safe folder name.
+        """
+
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name).strip("._") or "MicroLLMProject"
+
+    @staticmethod
+    def _read_json_if_exists(path: Path) -> Optional[Any]:
+        """Read a JSON file when it exists.
+
+        Args:
+            path: JSON file path.
+
+        Returns:
+            Parsed JSON or ``None``.
+        """
+
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, text: str) -> None:
+        """Set combo text when the value exists.
+
+        Args:
+            combo: Combo box to update.
+            text: Display text to select.
+        """
+
+        index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _set_combo_by_data(self, combo: QComboBox, value: str, labels: dict[str, str]) -> None:
+        """Set a combo by internal saved value.
+
+        Args:
+            combo: Combo box to update.
+            value: Internal saved value.
+            labels: Mapping from saved value to display label.
+        """
+
+        self._set_combo_text(combo, labels.get(value, value))
+
     def _run_task(
         self,
         fn,
@@ -1692,6 +1988,9 @@ class MainWindow(QMainWindow):
             extract_code_blocks=self.extract_code_blocks.isChecked(),
             preserve_indentation=self.preserve_indentation.isChecked(),
             generate_instruction_samples=self.instruction_samples.isChecked(),
+            prepare_mode=self._prepare_mode_value(),
+            tokenizer_strategy=self._tokenizer_strategy_value(),
+            tokenizer_path=Path(self.tokenizer_path.text()) if self.tokenizer_path.text().strip() else None,
         )
         self.dataset_log.clear()
         self.dataset_progress.setValue(0)
@@ -1724,6 +2023,9 @@ class MainWindow(QMainWindow):
             f"Prepared {result.document_count} documents, {result.character_count:,} characters, "
             f"{result.token_count:,} tokens, vocab {result.vocab_size:,}."
         )
+        self.dataset_log.append(
+            f"Cache summary: reused {result.cached_file_count:,} file(s), processed {result.processed_file_count:,} file(s)."
+        )
         if result.warning:
             self.dataset_log.append(f"Recommendation: {result.warning}")
         self.train_data_dir.setText(str(result.output_dir))
@@ -1734,6 +2036,57 @@ class MainWindow(QMainWindow):
                 f"Dataset: {result.code_sample_count:,} code, {result.prose_sample_count:,} prose, {result.token_count:,} tokens"
             )
         self._clear_button_busy("DataSet Prepared")
+
+    def _prepare_mode_value(self) -> str:
+        """Return the selected dataset preparation mode.
+
+        Returns:
+            Internal mode value.
+        """
+
+        label = self.prepare_mode.currentText()
+        if label == "Full rebuild":
+            return "full_rebuild"
+        if label == "Force reprocess":
+            return "force_reprocess"
+        return "incremental"
+
+    def _tokenizer_strategy_value(self) -> str:
+        """Return the selected tokenizer strategy.
+
+        Returns:
+            Internal tokenizer strategy value.
+        """
+
+        label = self.tokenizer_strategy.currentText()
+        if label == "Train new tokenizer":
+            return "train_new"
+        if label == "Reuse dataset tokenizer":
+            return "reuse_dataset"
+        if label == "Import tokenizer.json":
+            return "import_tokenizer"
+        return "auto"
+
+    def _tokenizer_strategy_reuses(self) -> bool:
+        """Return whether current tokenizer strategy ignores vocabulary controls.
+
+        Returns:
+            True when an existing tokenizer is selected directly.
+        """
+
+        return self.tokenizer_strategy.currentText() in {"Reuse dataset tokenizer", "Import tokenizer.json"}
+
+    def _update_tokenizer_strategy_controls(self) -> None:
+        """Enable only the tokenizer inputs relevant to the selected strategy."""
+
+        imports_tokenizer = self.tokenizer_strategy.currentText() == "Import tokenizer.json"
+        reuses_tokenizer = self._tokenizer_strategy_reuses()
+        if hasattr(self, "tokenizer_path_row"):
+            self.tokenizer_path_row.setEnabled(imports_tokenizer)
+        self.tokenizer_path.setEnabled(imports_tokenizer)
+        self.auto_vocab.setEnabled(not reuses_tokenizer)
+        self.manual_vocab_size.setEnabled(not reuses_tokenizer and not self.auto_vocab.isChecked())
+        self.min_frequency.setEnabled(not reuses_tokenizer)
 
     def start_training(self) -> None:
         """Collect training options and start model training."""

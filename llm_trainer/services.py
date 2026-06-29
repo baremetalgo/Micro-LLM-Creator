@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import DatasetConfig, ModelConfig, TrainingConfig, dataclass_to_jsonable
-from .data import load_documents, write_training_corpus
-from .tokenizer import PAD_TOKEN, encode_text, token_id, train_tokenizer
+from .data import (
+    document_from_dict,
+    document_to_dict,
+    expand_code_documents,
+    file_sha256,
+    read_supported_document,
+    supported_source_paths,
+    write_training_corpus,
+)
+from .tokenizer import PAD_TOKEN, encode_text, load_tokenizer, token_id, train_tokenizer
 from .training import TrainingResult, split_tokens, train_model
 
 
@@ -26,6 +35,8 @@ class DatasetBuildResult:
         warning: Optional dataset quality warning.
         code_sample_count: Number of code samples.
         prose_sample_count: Number of prose samples.
+        cached_file_count: Number of unchanged source files reused from cache.
+        processed_file_count: Number of source files extracted this run.
     """
 
     output_dir: Path
@@ -38,6 +49,8 @@ class DatasetBuildResult:
     warning: Optional[str] = None
     code_sample_count: int = 0
     prose_sample_count: int = 0
+    cached_file_count: int = 0
+    processed_file_count: int = 0
 
 
 def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
@@ -96,6 +109,219 @@ def content_warning(character_count: int) -> Optional[str]:
     return None
 
 
+def _resolve_tokenizer_strategy(config: DatasetConfig, tokenizer_path: Path) -> tuple[str, bool]:
+    """Resolve tokenizer strategy into an executable mode.
+
+    Args:
+        config: Dataset configuration.
+        tokenizer_path: Dataset tokenizer output path.
+
+    Returns:
+        Strategy name and whether the dataset tokenizer should be reused.
+    """
+
+    strategy = config.tokenizer_strategy or "auto"
+    if strategy == "auto":
+        return strategy, config.prepare_mode == "incremental" and tokenizer_path.exists()
+    if strategy == "reuse_dataset":
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(
+                f"Cannot reuse dataset tokenizer because tokenizer.json was not found in {config.output_dir}."
+            )
+        return strategy, True
+    if strategy in {"train_new", "import_tokenizer"}:
+        return strategy, False
+    raise ValueError(f"Unsupported tokenizer strategy: {strategy}")
+
+
+def _load_or_create_tokenizer(
+    config: DatasetConfig,
+    corpus_path: Path,
+    tokenizer_path: Path,
+    selected_vocab_size: int,
+    progress: Optional[Callable[[Any], None]],
+) -> tuple[Any, bool, bool, Optional[str]]:
+    """Load, import, or train a tokenizer for the prepared corpus.
+
+    Args:
+        config: Dataset configuration.
+        corpus_path: Normalized training corpus path.
+        tokenizer_path: Dataset tokenizer output path.
+        selected_vocab_size: Vocabulary size used when training a new tokenizer.
+        progress: Optional progress callback.
+
+    Returns:
+        Tokenizer, reused flag, imported flag, and optional source path.
+    """
+
+    strategy, reuse_tokenizer = _resolve_tokenizer_strategy(config, tokenizer_path)
+    imported = False
+    source_path: Optional[str] = None
+
+    if reuse_tokenizer:
+        _emit(progress, "Reusing existing dataset tokenizer.json...", 62)
+        return load_tokenizer(tokenizer_path), True, imported, source_path
+
+    if strategy == "import_tokenizer":
+        if config.tokenizer_path is None:
+            raise ValueError("Choose a tokenizer.json file when tokenizer strategy is Import tokenizer.json.")
+        import_path = Path(config.tokenizer_path)
+        if not import_path.exists():
+            raise FileNotFoundError(f"Tokenizer import file not found: {import_path}")
+        _emit(progress, f"Importing tokenizer from {import_path}...", 62)
+        tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+        if import_path.resolve() != tokenizer_path.resolve():
+            shutil.copy2(import_path, tokenizer_path)
+        return load_tokenizer(tokenizer_path), False, True, str(import_path)
+
+    _emit(progress, "Training tokenizer. This may take a while for large PDF folders...", 62)
+    tokenizer = train_tokenizer(
+        corpus_path,
+        tokenizer_path,
+        vocab_size=selected_vocab_size,
+        min_frequency=config.min_frequency,
+    )
+    return tokenizer, False, imported, source_path
+
+
+def _cache_key(config: DatasetConfig) -> str:
+    """Return a cache key for extraction-affecting options.
+
+    Args:
+        config: Dataset configuration.
+
+    Returns:
+        Cache key string.
+    """
+
+    return json.dumps(
+        {
+            "lowercase": config.lowercase,
+            "code_training_mode": config.code_training_mode,
+            "include_prose": config.include_prose,
+            "include_source_code": config.include_source_code,
+            "extract_code_blocks": config.extract_code_blocks,
+            "preserve_indentation": config.preserve_indentation,
+        },
+        sort_keys=True,
+    )
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    """Read a dataset manifest.
+
+    Args:
+        path: Manifest path.
+
+    Returns:
+        Manifest dictionary.
+    """
+
+    if not path.exists():
+        return {"version": 1, "files": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_documents_with_cache(
+    config: DatasetConfig,
+    progress: Optional[Callable[[Any], None]],
+    should_stop: Optional[Callable[[], bool]],
+) -> tuple[list[Any], dict[str, Any], int, int]:
+    """Load documents using an extraction cache.
+
+    Args:
+        config: Dataset configuration.
+        progress: Optional progress callback.
+        should_stop: Optional cancellation callback.
+
+    Returns:
+        Documents, manifest, cached file count, processed file count.
+    """
+
+    manifest_path = config.output_dir / "dataset_manifest.json"
+    cache_dir = config.output_dir / "cache" / "documents"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _read_manifest(manifest_path)
+    manifest.setdefault("files", {})
+    key = _cache_key(config)
+    force_reprocess = config.prepare_mode == "force_reprocess"
+
+    source_paths = supported_source_paths(
+        config.input_dir,
+        code_training_mode=config.code_training_mode,
+        include_source_code=config.include_source_code,
+    )
+    _emit(progress, f"Found {len(source_paths)} supported files in {config.input_dir}.", 8)
+    documents: list[Any] = []
+    cached_count = 0
+    processed_count = 0
+    new_files: dict[str, Any] = {}
+
+    for index, path in enumerate(source_paths, start=1):
+        if should_stop and should_stop():
+            raise RuntimeError("Dataset preparation stopped by user.")
+        percent = 10 + int(32 * index / max(len(source_paths), 1))
+        stat = path.stat()
+        digest = file_sha256(path)
+        cache_path = cache_dir / f"{digest}.json"
+        manifest_key = str(path.resolve())
+        previous = manifest.get("files", {}).get(manifest_key, {})
+        can_use_cache = (
+            not force_reprocess
+            and previous.get("sha256") == digest
+            and previous.get("cache_key") == key
+            and cache_path.exists()
+        )
+        if can_use_cache:
+            cached_documents = [
+                document_from_dict(item)
+                for item in json.loads(cache_path.read_text(encoding="utf-8"))
+            ]
+            documents.extend(cached_documents)
+            cached_count += 1
+            _emit(progress, f"Reused {path.name} from cache ({len(cached_documents)} sample(s)).", percent)
+        else:
+            source_doc = read_supported_document(
+                path,
+                lowercase=config.lowercase,
+                code_training_mode=config.code_training_mode,
+                preserve_indentation=config.preserve_indentation,
+            )
+            if source_doc is None:
+                _emit(progress, f"Skipped {path.name}: no readable text found.", percent)
+                continue
+            source_documents = [source_doc]
+            if config.code_training_mode:
+                source_documents = expand_code_documents(
+                    source_documents,
+                    include_prose=config.include_prose,
+                    extract_code_blocks=config.extract_code_blocks,
+                    preserve_indentation=config.preserve_indentation,
+                    should_stop=should_stop,
+                )
+            cache_path.write_text(
+                json.dumps([document_to_dict(doc) for doc in source_documents], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            documents.extend(source_documents)
+            processed_count += 1
+            _emit(progress, f"Processed {path.name}: {len(source_documents)} sample(s).", percent)
+
+        new_files[manifest_key] = {
+            "path": str(path),
+            "sha256": digest,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "cache_key": key,
+            "cache_file": str(cache_path.relative_to(config.output_dir)),
+        }
+
+    manifest["files"] = new_files
+    manifest["dataset_config"] = dataclass_to_jsonable(config)
+    manifest["cache_key"] = key
+    return sorted(documents, key=lambda document: (str(document.path), document.kind, document.language or "")), manifest, cached_count, processed_count
+
+
 def build_dataset(
     config: DatasetConfig,
     progress: Optional[Callable[[Any], None]] = None,
@@ -117,18 +343,7 @@ def build_dataset(
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     _emit(progress, "Scanning source folder...", 3)
-    documents = load_documents(
-        config.input_dir,
-        lowercase=config.lowercase,
-        max_workers=config.max_workers,
-        code_training_mode=config.code_training_mode,
-        include_prose=config.include_prose,
-        include_source_code=config.include_source_code,
-        extract_code_blocks=config.extract_code_blocks,
-        preserve_indentation=config.preserve_indentation,
-        progress=progress,
-        should_stop=should_stop,
-    )
+    documents, manifest, cached_file_count, processed_file_count = _load_documents_with_cache(config, progress, should_stop)
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
     if not documents:
@@ -145,6 +360,8 @@ def build_dataset(
     _emit(progress, f"Content size: {character_count:,} characters across {len(documents)} files.", 45)
     if config.code_training_mode:
         _emit(progress, f"Code mode: {code_sample_count:,} code samples, {prose_sample_count:,} prose samples.", 46)
+    if cached_file_count or processed_file_count:
+        _emit(progress, f"Cache: reused {cached_file_count:,} file(s), processed {processed_file_count:,} file(s).", 47)
     _emit(progress, f"Unique word estimate: {unique_words:,}.", 48)
     _emit(progress, f"Auto vocabulary size: {selected_vocab_size:,}.", 50)
     if warning:
@@ -161,14 +378,14 @@ def build_dataset(
         generate_instruction_samples=config.generate_instruction_samples,
     )
     tokenizer_path = config.output_dir / "tokenizer.json"
-    _emit(progress, "Training tokenizer. This may take a while for large PDF folders...", 62)
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
-    tokenizer = train_tokenizer(
+    tokenizer, reuse_tokenizer, tokenizer_imported, tokenizer_source_path = _load_or_create_tokenizer(
+        config,
         corpus_path,
         tokenizer_path,
-        vocab_size=selected_vocab_size,
-        min_frequency=config.min_frequency,
+        selected_vocab_size,
+        progress,
     )
 
     _emit(progress, "Encoding corpus into token IDs...", 78)
@@ -192,8 +409,16 @@ def build_dataset(
         "tokenizer_vocab_size": tokenizer.get_vocab_size(),
         "warning": warning,
         "source_files": [str(doc.path) for doc in documents],
+        "cached_file_count": cached_file_count,
+        "processed_file_count": processed_file_count,
+        "prepare_mode": config.prepare_mode,
+        "tokenizer_strategy": config.tokenizer_strategy,
+        "tokenizer_reused": reuse_tokenizer,
+        "tokenizer_imported": tokenizer_imported,
+        "tokenizer_source_path": tokenizer_source_path,
     }
     (config.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (config.output_dir / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _emit(progress, f"Dataset ready: {config.output_dir}", 100)
     return DatasetBuildResult(
         config.output_dir,
@@ -206,6 +431,8 @@ def build_dataset(
         warning,
         code_sample_count,
         prose_sample_count,
+        cached_file_count,
+        processed_file_count,
     )
 
 

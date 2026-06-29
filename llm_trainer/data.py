@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,86 @@ class Document:
     text: str
     kind: str = "prose"
     language: Optional[str] = None
+
+
+def document_to_dict(document: Document) -> dict[str, Any]:
+    """Convert a document to a JSON-friendly dictionary.
+
+    Args:
+        document: Document to serialize.
+
+    Returns:
+        JSON-friendly document dictionary.
+    """
+
+    return {
+        "path": str(document.path),
+        "text": document.text,
+        "kind": document.kind,
+        "language": document.language,
+    }
+
+
+def document_from_dict(value: dict[str, Any]) -> Document:
+    """Load a document from a dictionary.
+
+    Args:
+        value: Serialized document.
+
+    Returns:
+        Document instance.
+    """
+
+    return Document(
+        path=Path(value["path"]),
+        text=str(value.get("text", "")),
+        kind=str(value.get("kind", "prose")),
+        language=value.get("language"),
+    )
+
+
+def file_sha256(path: Path) -> str:
+    """Calculate a file SHA-256 digest.
+
+    Args:
+        path: File path.
+
+    Returns:
+        Hex digest.
+    """
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def supported_source_paths(input_dir: Path, code_training_mode: bool = False, include_source_code: bool = True) -> list[Path]:
+    """Return supported source paths.
+
+    Args:
+        input_dir: Folder to scan.
+        code_training_mode: Whether source-code files are supported.
+        include_source_code: Whether to include source-code files.
+
+    Returns:
+        Sorted supported paths.
+
+    Raises:
+        FileNotFoundError: If the folder does not exist.
+    """
+
+    input_dir = Path(input_dir)
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
+    paths = [path for path in sorted(input_dir.rglob("*")) if path.is_file()]
+    return [
+        path
+        for path in paths
+        if path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES | {".pdf", ".jsonl"}
+        or (code_training_mode and include_source_code and path.suffix.lower() in SUPPORTED_CODE_SUFFIXES)
+    ]
 
 
 def clean_text(text: str, lowercase: bool = False) -> str:
@@ -278,6 +359,40 @@ def extract_code_blocks_from_text(document: Document, preserve_indentation: bool
     return blocks
 
 
+def expand_code_documents(
+    documents: list[Document],
+    include_prose: bool = True,
+    extract_code_blocks: bool = True,
+    preserve_indentation: bool = True,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> list[Document]:
+    """Expand documents for code-aware training.
+
+    Args:
+        documents: Loaded source documents.
+        include_prose: Whether to keep prose documents.
+        extract_code_blocks: Whether to extract code-like prose blocks.
+        preserve_indentation: Whether to preserve code indentation.
+        should_stop: Optional cancellation callback.
+
+    Returns:
+        Expanded document list.
+    """
+
+    expanded: list[Document] = []
+    for document in documents:
+        if should_stop and should_stop():
+            raise OperationCancelled("Dataset preparation stopped by user.")
+        if document.kind == "code":
+            expanded.append(document)
+            continue
+        if include_prose:
+            expanded.append(document)
+        if extract_code_blocks:
+            expanded.extend(extract_code_blocks_from_text(document, preserve_indentation=preserve_indentation))
+    return expanded
+
+
 def format_document_for_training(
     document: Document,
     generate_instruction_samples: bool = True,
@@ -345,13 +460,7 @@ def load_documents(
         raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
 
     documents: list[Document] = []
-    paths = [path for path in sorted(input_dir.rglob("*")) if path.is_file()]
-    supported_paths = [
-        path
-        for path in paths
-        if path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES | {".pdf", ".jsonl"}
-        or (code_training_mode and include_source_code and path.suffix.lower() in SUPPORTED_CODE_SUFFIXES)
-    ]
+    supported_paths = supported_source_paths(input_dir, code_training_mode=code_training_mode, include_source_code=include_source_code)
     if progress:
         progress({"message": f"Found {len(supported_paths)} supported files in {input_dir}.", "percent": 8})
 
@@ -391,18 +500,13 @@ def load_documents(
                 progress({"message": f"Loaded {path.name}: {len(document.text):,} characters.", "percent": percent})
 
     if code_training_mode:
-        expanded: list[Document] = []
-        for document in documents:
-            if should_stop and should_stop():
-                raise OperationCancelled("Dataset preparation stopped by user.")
-            if document.kind == "code":
-                expanded.append(document)
-                continue
-            if include_prose:
-                expanded.append(document)
-            if extract_code_blocks:
-                expanded.extend(extract_code_blocks_from_text(document, preserve_indentation=preserve_indentation))
-        documents = expanded
+        documents = expand_code_documents(
+            documents,
+            include_prose=include_prose,
+            extract_code_blocks=extract_code_blocks,
+            preserve_indentation=preserve_indentation,
+            should_stop=should_stop,
+        )
 
     return sorted(documents, key=lambda document: (str(document.path), document.kind, document.language or ""))
 

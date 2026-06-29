@@ -26,6 +26,9 @@ class DatasetConfig:
         extract_code_blocks: Detects code-like blocks in PDFs/text.
         preserve_indentation: Keeps code line breaks and indentation.
         generate_instruction_samples: Wraps code with simple instruction tags.
+        prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
+        tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
+        tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
     """
 
     input_dir: Path
@@ -42,6 +45,9 @@ class DatasetConfig:
     extract_code_blocks: bool = True
     preserve_indentation: bool = True
     generate_instruction_samples: bool = True
+    prepare_mode: str = "incremental"
+    tokenizer_strategy: str = "auto"
+    tokenizer_path: Optional[Path] = None
 
 
 @dataclass

@@ -39,7 +39,7 @@ The app has three main work areas:
 - `IN`: prepare datasets.
 - `AI`: configure and train the model.
 - `X`: export and quantize model artifacts.
-- `TEST`: load a GGUF model and chat with it locally.
+- `Chat`: load a GGUF model and chat with it locally.
 
 ## 2. Recommended Workflow
 
@@ -54,8 +54,31 @@ The app has three main work areas:
 9. Resume training if interrupted.
 10. Open `X`.
 11. Bundle or quantize the trained model.
-12. Open `TEST`.
+12. Open `Chat`.
 13. Load a GGUF model and test prompts in the chat window.
+14. Use `Save Project` to store paths and settings for the next session.
+
+## 2.1 Save and Open Projects
+
+The top bar has a project name field plus `Save Project` and `Open Project`.
+
+`Save Project` creates a folder using the project name and writes a
+`project.json` file inside it. This file stores:
+
+- Source, dataset, model, export, GGUF, tokenizer, and checkpoint paths.
+- Dataset preparation options.
+- Tokenizer policy.
+- Training architecture and optimizer options.
+- Export and chat settings.
+- Small summaries from existing dataset/model folders when available.
+
+Important:
+
+- The project file stores paths to large assets; it does not duplicate hundreds
+  of PDFs or large model checkpoints.
+- Keep your dataset and model folders in stable locations if you want projects
+  to reopen cleanly.
+- Use `Open Project` to restore the app controls from a saved `project.json`.
 
 ## 3. Dataset Preparation
 
@@ -116,6 +139,49 @@ Effect:
 - Higher values can speed up hundreds of PDFs/text files.
 - Very high values can make disk usage and CPU load heavy.
 - A good starting value is `4` to `8`.
+
+### Prepare Mode
+
+Controls how the dataset is updated.
+
+- `Incremental update`: reuses cached extracted text for unchanged files, processes only new/changed files, and can reuse the existing tokenizer when available.
+- `Full rebuild`: rebuilds corpus, tokenizer, and token files from all current source files. Cached extraction can still avoid rereading unchanged PDFs.
+- `Force reprocess`: ignores extraction cache, rereads all source files, rebuilds tokenizer, and rewrites token files.
+
+Recommendation:
+
+- Use `Incremental update` when you add more PDFs/source files later.
+- Use `Full rebuild` when you want the tokenizer to learn from all data again.
+- Use `Force reprocess` if extracted text looks wrong or source parsing options changed.
+
+The app writes `dataset_manifest.json` and cached extracted samples under
+`cache/documents` in the dataset folder.
+
+### Tokenizer Policy
+
+Controls how `tokenizer.json` is created.
+
+- `Auto`: recommended default. During incremental updates, the app reuses the
+  existing dataset tokenizer when it exists. Otherwise, it trains a new
+  tokenizer from the corpus.
+- `Train new tokenizer`: always trains a fresh tokenizer from the current
+  corpus. Use this after major corpus changes when you want the vocabulary to
+  relearn all data.
+- `Reuse dataset tokenizer`: requires an existing `tokenizer.json` in the
+  dataset folder. Use this when adding more data to an already trained model
+  family so token IDs stay stable.
+- `Import tokenizer.json`: copies a tokenizer from another compatible project
+  into the dataset folder. Use this only when the new dataset should stay
+  compatible with that tokenizer.
+
+Effect on the LLM:
+
+- Reusing a tokenizer keeps token IDs stable, which is important when continuing
+  work from older checkpoints.
+- Training a fresh tokenizer can better fit a changed corpus, but old
+  checkpoints are no longer compatible because token IDs may change.
+- Imported tokenizers are useful for professional workflows where multiple
+  datasets share the same vocabulary.
 
 ### Lowercase Text
 
