@@ -1,7 +1,8 @@
 <p align="center">copyright @ Indra (Intelligent Network for Deliberation, Reasoning & Action)</p>
 
 # Micro LLM Creator
-<p align="center"><img src="01.png" width="24%" /><img src="02.png" width="24%" /><img src="03.png" width="24%" /><img src="04.png" width="24%" /></p>
+<p align="center"><img src="03.png" width="50%" /><img src="04.png" width="50%" /></p>
+<p align="center"><img src="01.png" width="50" /><img src="02.png" width="50%" /></p>
 
 Desktop app for preparing text/code datasets and training small
 GPT-style language models.
