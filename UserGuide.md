@@ -34,10 +34,11 @@ chmod +x run_app.py
 
 Minimum supported Python version is Python 3.9.
 
-The app has three main work areas:
+The app has five main work areas:
 
 - `IN`: prepare datasets.
 - `AI`: configure and train the model.
+- `Bench`: run repeatable benchmark prompts against a trained checkpoint.
 - `X`: export and quantize model artifacts.
 - `Chat`: load a GGUF model and chat with it locally.
 
@@ -58,9 +59,15 @@ The app has three main work areas:
 13. Load a GGUF model and test prompts in the chat window.
 14. Use `Save Project` to store paths and settings for the next session.
 
-## 2.1 Save and Open Projects
+## 2.1 New, Save, and Open Projects
 
-The top bar has a project name field plus `Save Project` and `Open Project`.
+The top bar has a project name field plus `New Project`, `Save Project`, and
+`Open Project`.
+
+`New Project` clears the active project binding and restores fresh defaults.
+Use it when you opened an existing project but want to start a different one.
+It resets visible status, progress bars, logs, charts, chat state, and default
+run folders. The next `Save Project` will ask for a new parent folder.
 
 `Save Project` creates a folder using the project name and writes a
 `project.json` file inside it. This file stores:
@@ -79,12 +86,20 @@ Important:
 - Keep your dataset and model folders in stable locations if you want projects
   to reopen cleanly.
 - Use `Open Project` to restore the app controls from a saved `project.json`.
+- Use `New Project` before creating a separate experiment from scratch.
 
 ## 3. Dataset Preparation
 
 Dataset preparation converts your files into a tokenizer-ready corpus. It also
 trains a byte-level BPE tokenizer and splits tokens into training and validation
 streams.
+
+The `IN` tab is organized into:
+
+- `Source Array`: source folder, dataset folder, parallel workers, and prepare mode.
+- `Tokenizer Core`: vocabulary, tokenizer policy, context, validation, and code options.
+- `Dataset Quality`: sample, token, vocabulary, code/prose, cache, and warning summary.
+- `Ingest Telemetry`: live preparation messages while files are processed.
 
 ### Source Vault
 
@@ -764,7 +779,7 @@ Effect:
 
 ### Benchmark Prompts
 
-Fixed prompts used to test a trained checkpoint after training.
+Fixed prompts used to test a trained checkpoint from the `Bench` tab.
 
 Effect:
 
@@ -809,6 +824,100 @@ def add(a, b):
 print(a + b)
 ```
 ````
+
+## 4.1 Training Metrics and Telemetry
+
+The `AI` tab shows live training telemetry while a run is active.
+
+### ETA
+
+Estimated time remaining based on recent completed training steps.
+
+Effect:
+
+- Gives a practical time estimate after enough steps have completed.
+- May fluctuate early in training while speed stabilizes.
+- Changes when validation, checkpoint saving, or hardware load affects speed.
+
+### Epoch and Step
+
+Current epoch and optimizer step progress.
+
+Effect:
+
+- Shows how far the run has progressed.
+- Helps confirm resume behavior after interruption.
+
+### Train Loss
+
+Current training loss.
+
+Effect:
+
+- Measures how well the model fits the training tokens.
+- Should usually decrease over time.
+
+### Validation Loss
+
+Loss on held-out validation tokens.
+
+Effect:
+
+- Measures generalization.
+- If validation loss rises while training loss falls, the model may be overfitting.
+
+### Learning Rate
+
+Current learning rate from the scheduler.
+
+Effect:
+
+- Helps diagnose warmup and decay behavior.
+- Loss spikes can sometimes correlate with too much learning rate.
+
+### Gradient Norm
+
+Magnitude of gradients before/after clipping.
+
+Effect:
+
+- Large spikes can indicate unstable training.
+- Values collapsing toward zero can indicate stalled learning.
+
+### Weight Norm
+
+Magnitude of model parameters.
+
+Effect:
+
+- Helps monitor parameter stability during longer runs.
+
+### Parameter Update Ratio
+
+Approximate size of updates relative to parameter size.
+
+Effect:
+
+- Very large values can destabilize training.
+- Very tiny values can mean the model is barely learning.
+
+### Tokens/sec and Samples/sec
+
+Training throughput.
+
+Effect:
+
+- Shows hardware and data pipeline speed.
+- Useful when tuning batch size, context length, and GPU settings.
+
+### VRAM Usage
+
+CUDA memory allocated/reserved during GPU training.
+
+Effect:
+
+- Helps identify memory bottlenecks.
+- Useful when choosing batch size, context length, and model size.
 
 ## 5. Export Options
 
@@ -928,7 +1037,24 @@ model_core/hf_model
 Use this only when `hf_model` is a real Hugging Face-compatible model folder.
 The app will fail with a clear message instead of writing a fake GGUF file.
 
-## 6. Test Chat Options
+## 6. Benchmark Tab
+
+The `Bench` tab runs fixed prompts against a trained MicroGPT checkpoint. Use it
+to compare model versions after changing data, tokenizer policy, architecture,
+or training settings.
+
+The benchmark panel includes:
+
+- Prompt list separated by blank lines.
+- Max tokens.
+- Temperature.
+- KV cache toggle.
+- Run and stop controls.
+- Benchmark telemetry log.
+
+Outputs are saved under the model folder in `benchmarks/`.
+
+## 7. Test Chat Options
 
 The `Chat` tab is for trying a GGUF model through llama.cpp without reloading it
 for every message.
@@ -1004,6 +1130,21 @@ If source build fails with `CUDA Toolkit not found` or `Could not find nvcc`,
 install NVIDIA CUDA Toolkit first and ensure `nvcc --version` works in the same
 terminal.
 
+### Thinking
+
+Turns reasoning-style prompting on or off.
+
+Effect:
+
+- When enabled, the app adds an instruction style based on Reasoning Effort.
+- When disabled, the app asks for a more direct answer.
+- This changes prompting behavior; it does not retrain the model.
+
+Recommendation:
+
+- Keep enabled when testing explanation, debugging, or review behavior.
+- Turn off when you want short direct answers.
+
 ### Reasoning Effort
 
 Instruction style sent with each prompt.
@@ -1057,7 +1198,7 @@ Effect:
 - Helps steer style, role, and answer format.
 - Does not retrain the model.
 
-## 7. Suggested Settings
+## 8. Suggested Settings
 
 ### Smoke Test
 
@@ -1098,7 +1239,7 @@ Use this when you have more data and VRAM.
 - Batch size: `8+`
 - Gradient accumulation: increase if VRAM is limited
 
-## 8. Programming PDFs: Best Practice
+## 9. Programming PDFs: Best Practice
 
 Programming PDFs help most when used as explanation data. Raw PDF code is often
 damaged during extraction. For best results:
@@ -1127,12 +1268,14 @@ Avoid:
 - Vendor/build folders.
 - Duplicate content.
 
-## 9. How to Know Training Is Working
+## 10. How to Know Training Is Working
 
 Good signs:
 
 - Training loss decreases.
 - Validation loss decreases or stabilizes.
+- ETA and step counters continue moving.
+- Tokens/sec and samples/sec stay reasonably stable.
 - Generated samples become more structured.
 - Code indentation improves.
 
@@ -1140,6 +1283,8 @@ Bad signs:
 
 - Loss becomes `nan`.
 - Validation loss rises while training loss falls.
+- Gradient norm spikes repeatedly.
+- VRAM usage approaches the hardware limit.
 - Generated text repeats endlessly.
 - Code loses indentation.
 
@@ -1151,7 +1296,7 @@ Fixes:
 - Increase validation split slightly.
 - Use source-code files instead of PDF-only code.
 
-## 10. Important Limitations
+## 11. Important Limitations
 
 This app trains small models from scratch. A small model will not automatically
 match large commercial coding models. To improve behavior, you need:

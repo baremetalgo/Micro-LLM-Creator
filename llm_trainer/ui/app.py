@@ -336,6 +336,10 @@ class MainWindow(QMainWindow):
         self.search_box.setPlaceholderText("Project name...")
         self.search_box.setMaximumWidth(260)
         self._tip(self.search_box, "Project name used when saving or reopening a Micro LLM Creator project.")
+        self.new_project_button = QPushButton("New Project")
+        self.new_project_button.setMaximumWidth(130)
+        self.new_project_button.clicked.connect(self.new_project)
+        self._tip(self.new_project_button, "Start a fresh Micro LLM Creator project with default paths and settings.")
         self.save_project_button = QPushButton("Save Project")
         self.save_project_button.setMaximumWidth(130)
         self.save_project_button.clicked.connect(self.save_project)
@@ -361,6 +365,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(logo)
         top_layout.addSpacing(12)
         top_layout.addWidget(self.search_box)
+        top_layout.addWidget(self.new_project_button)
         top_layout.addWidget(self.save_project_button)
         top_layout.addWidget(self.open_project_button)
         top_layout.addSpacing(10)
@@ -512,9 +517,14 @@ class MainWindow(QMainWindow):
         title = self._page_title("Data Ingestion Matrix")
         layout.addWidget(title)
 
-        module_grid = QGridLayout()
-        module_grid.setHorizontalSpacing(14)
-        module_grid.setVerticalSpacing(14)
+        ingestion_body = QHBoxLayout()
+        ingestion_body.setSpacing(14)
+        left_column = QVBoxLayout()
+        left_column.setSpacing(10)
+        right_column = QVBoxLayout()
+        right_column.setSpacing(10)
+        ingestion_body.addLayout(left_column, 1)
+        ingestion_body.addLayout(right_column, 1)
 
         source_form = QFormLayout()
         self._configure_form(source_form)
@@ -616,11 +626,12 @@ class MainWindow(QMainWindow):
         tokenizer_form.addRow("", self.preserve_indentation)
         tokenizer_form.addRow("", self.instruction_samples)
         tokenizer_form.addRow("Reasoning samples", self.reasoning_sample_mode)
-        module_grid.addWidget(self._card("SOURCE ARRAY", source_form), 0, 0)
-        module_grid.addWidget(self._card("TOKENIZER CORE", tokenizer_form), 0, 1)
-        module_grid.setColumnStretch(0, 1)
-        module_grid.setColumnStretch(1, 1)
-        layout.addLayout(module_grid)
+        source_card = self._card("SOURCE ARRAY", source_form)
+        source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        tokenizer_card = self._card("TOKENIZER CORE", tokenizer_form)
+        tokenizer_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        left_column.addWidget(source_card, 0)
+        right_column.addWidget(tokenizer_card, 0)
 
         quality_grid = QGridLayout()
         quality_grid.setHorizontalSpacing(8)
@@ -641,7 +652,9 @@ class MainWindow(QMainWindow):
         ]
         for index, item in enumerate(quality_items):
             quality_grid.addWidget(item, index // 3, index % 3)
-        layout.addWidget(self._card("DATASET QUALITY", quality_grid), 0)
+        quality_card = self._card("DATASET QUALITY", quality_grid)
+        quality_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        right_column.addWidget(quality_card, 0)
 
         self.prepare_button = QPushButton("Prepare Dataset")
         self._tip(self.prepare_button, "Read source files, clean text, train tokenizer, split tokens, and save the dataset project.")
@@ -655,10 +668,13 @@ class MainWindow(QMainWindow):
 
         self.dataset_log = QTextEdit()
         self.dataset_log.setReadOnly(True)
-        self.dataset_log.setMaximumHeight(140)
+        self.dataset_log.setMinimumHeight(260)
+        self.dataset_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         log_layout = QVBoxLayout()
-        log_layout.addWidget(self.dataset_log)
-        layout.addWidget(self._card("INGEST TELEMETRY", log_layout), 0)
+        log_layout.addWidget(self.dataset_log, 1)
+        left_column.addWidget(self._card("INGEST TELEMETRY", log_layout), 1)
+        right_column.addStretch(1)
+        layout.addLayout(ingestion_body, 1)
         action_row = QHBoxLayout()
         action_row.addWidget(self.prepare_button)
         action_row.addWidget(self.stop_dataset_button)
@@ -2074,6 +2090,32 @@ class MainWindow(QMainWindow):
         if self.current_project_file == project_file:
             self.dataset_log.append(f"Project saved: {project_file}")
 
+    def new_project(self) -> None:
+        """Start a fresh project and clear the active project file binding."""
+
+        if self.thread is not None:
+            QMessageBox.information(self, "Task running", "Please stop or wait for the current task before creating a new project.")
+            return
+        if self.current_project_file is not None or self.search_box.text().strip():
+            choice = QMessageBox.question(
+                self,
+                "New project",
+                "Start a new project? Unsaved changes in the current project will not be saved automatically.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        if self.chat_session is not None and hasattr(self.chat_session, "reset"):
+            self.chat_session.reset()
+        self.chat_session = None
+        self.current_project_file = None
+        self._apply_project_state(self._default_project_state())
+        self._reset_project_runtime_state()
+        self.project_state.setText("New project")
+        self.dataset_log.append("Started a new project.")
+
     def open_project(self) -> None:
         """Open a saved project file and restore UI settings."""
 
@@ -2094,6 +2136,150 @@ class MainWindow(QMainWindow):
         self.current_project_file = Path(project_file)
         self.project_state.setText("Project opened")
         self.dataset_log.append(f"Opened project: {project_file}")
+
+    def _default_project_state(self) -> dict[str, Any]:
+        """Build the default state used for a newly created project.
+
+        Returns:
+            JSON-style project state with fresh paths and default settings.
+        """
+
+        runs_dir = Path.cwd() / "runs"
+        dataset_dir = runs_dir / "dataset"
+        model_dir = runs_dir / "model"
+        export_dir = runs_dir / "export"
+        return {
+            "schema": "micro_llm_creator_project",
+            "version": 1,
+            "project_name": "",
+            "project_dir": "",
+            "paths": {
+                "source_vault": "",
+                "dataset_core": str(dataset_dir),
+                "training_dataset": str(dataset_dir),
+                "model_output": str(model_dir),
+                "export_model_core": str(model_dir),
+                "export_output": str(export_dir),
+                "llama_cpp_dir": "",
+                "gguf_output_path": str(export_dir / "model.gguf"),
+                "gguf_model": "",
+                "tokenizer_import": "",
+                "resume_checkpoint": "",
+            },
+            "dataset": {
+                "auto_vocab": True,
+                "manual_vocab_size": 8000,
+                "min_frequency": 2,
+                "context_length": 128,
+                "validation_split": 0.1,
+                "lowercase": False,
+                "max_workers": 4,
+                "prepare_mode": "incremental",
+                "tokenizer_strategy": "auto",
+                "code_training_mode": True,
+                "include_prose": True,
+                "include_source_code": True,
+                "extract_code_blocks": True,
+                "preserve_indentation": True,
+                "instruction_samples": True,
+                "reasoning_sample_mode": "scaffold",
+            },
+            "training": {
+                "preset": "Tiny",
+                "architecture_style": "Classic GPT",
+                "n_embd": 128,
+                "n_head": 4,
+                "n_layer": 4,
+                "context_length": 128,
+                "dropout": 0.1,
+                "epochs": 5,
+                "batch_size": 16,
+                "learning_rate": 0.0003,
+                "weight_decay": 0.1,
+                "gradient_accumulation": 1,
+                "warmup_steps": 100,
+                "eval_interval": 100,
+                "save_interval": 500,
+                "max_grad_norm": 1.0,
+                "seed": 1337,
+                "device": self.device.currentText(),
+                "use_amp": self.use_amp_default,
+                "resume": True,
+                "require_compatible_resume": True,
+                "benchmark_prompts": "\n\n".join(DEFAULT_BENCHMARK_PROMPTS),
+                "benchmark_tokens": 128,
+                "benchmark_temperature": 0.7,
+                "benchmark_kv_cache": True,
+            },
+            "export": {
+                "quantization": "FP16 checkpoint",
+                "gguf_outtype": "f16",
+            },
+            "chat": {
+                "context": 2048,
+                "cpu_threads": 4,
+                "gpu_layers": -1,
+                "thinking_enabled": True,
+                "reasoning_effort": "Balanced",
+                "max_tokens": 512,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
+                "system_prompt": "",
+            },
+            "artifacts": {},
+        }
+
+    def _reset_project_runtime_state(self) -> None:
+        """Clear logs, progress, charts, and status labels for a new project."""
+
+        self.dataset_log.clear()
+        self.training_log.clear()
+        self.benchmark_log.clear()
+        self.export_log.setPlainText(
+            "Export options:\n"
+            "- Bundle copies final_model.pt, tokenizer.json, and training_summary.json.\n"
+            "- HF package writes model_core/hf_model for portable MicroGPT loading.\n"
+            "- FP16 checkpoint quantization works now.\n"
+            "- GGUF conversion uses llama.cpp when model_core/hf_model exists.\n"
+            "- Native MicroGPT checkpoints are not written as fake GGUF files.\n"
+        )
+        for progress in (self.dataset_progress, self.training_progress, self.benchmark_progress, self.export_progress, self.chat_progress):
+            progress.setRange(0, 100)
+            progress.setValue(0)
+        self.dataset_status.setText("Dataset: not prepared")
+        self.train_status.setText("Training: idle")
+        self.export_status.setText("Export: waiting")
+        self.chat_status.setText("Chat: no GGUF loaded")
+        self.prepare_button.setText("Prepare Dataset")
+        self.train_button.setText("Start Training")
+        self.stop_dataset_button.setEnabled(False)
+        self.stop_training_button.setEnabled(False)
+        self.stop_benchmark_button.setEnabled(False)
+        self.stop_chat_button.setEnabled(False)
+        self.load_llm_button.setText("Load Model")
+        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+        self._reset_dataset_quality_report()
+        self.training_epoch_metric.setText("Epoch: -")
+        self.training_step_metric.setText("Step: -")
+        self.training_loss_metric.setText("Train loss: -")
+        self.training_val_metric.setText("Val loss: -")
+        self.training_lr_metric.setText("LR: -")
+        self.training_speed_metric.setText("Speed: -")
+        self.training_grad_metric.setText("Grad: -")
+        self.training_vram_metric.setText("VRAM: -")
+        self.training_eta_metric.setText("ETA: -")
+        self.loss_chart.clear()
+        self.optimization_chart.clear()
+        self.stability_chart.clear()
+        self.throughput_chart.clear()
+        self.memory_chart.clear()
+        self._clear_chat_messages()
+        self.chat_markdown = ""
+        self.chat_stream_prefix = ""
+        self.chat_stream_reply = ""
+        self.chat_stats.setText("Idle")
+        self._add_chat_message("assistant", "Load a GGUF model to start testing.")
 
     def _project_state_dict(self, project_name: str, project_dir: Path) -> dict[str, Any]:
         """Collect all UI state that defines a Micro LLM project.
