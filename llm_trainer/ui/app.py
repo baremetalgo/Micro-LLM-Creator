@@ -3,8 +3,10 @@ from __future__ import annotations
 import ctypes
 from datetime import datetime
 import json
+import os
 from queue import Empty, Queue
 import re
+import signal
 import sys
 from pathlib import Path
 from threading import Event
@@ -12,7 +14,7 @@ from typing import Any, Optional, Union
 from urllib.parse import quote
 
 import torch
-from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -124,6 +126,8 @@ class MainWindow(QMainWindow):
         self.active_stop_button: Optional[QPushButton] = None
         self.active_button_text = ""
         self.active_button_restore_text = ""
+        self.current_project_file: Optional[Path] = None
+        self.interrupt_count = 0
         self.chat_session: Optional[LlamaChatSession] = None
         self.chat_markdown = ""
         self.chat_stream_prefix = ""
@@ -1511,15 +1515,21 @@ class MainWindow(QMainWindow):
 
         project_name = self.search_box.text().strip() or "MicroLLMProject"
         safe_name = self._safe_project_name(project_name)
-        base_dir = QFileDialog.getExistingDirectory(self, "Choose parent folder for project", str(Path.cwd()))
-        if not base_dir:
-            return
-        project_dir = Path(base_dir) / safe_name
+        if self.current_project_file is None:
+            base_dir = QFileDialog.getExistingDirectory(self, "Choose parent folder for project", str(Path.cwd()))
+            if not base_dir:
+                return
+            project_dir = Path(base_dir) / safe_name
+            project_file = project_dir / "project.json"
+        else:
+            project_file = self.current_project_file
+            project_dir = project_file.parent
         project_dir.mkdir(parents=True, exist_ok=True)
-        project_file = project_dir / "project.json"
         project_file.write_text(json.dumps(self._project_state_dict(project_name, project_dir), indent=2), encoding="utf-8")
+        self.current_project_file = project_file
         self.project_state.setText("Project saved")
-        QMessageBox.information(self, "Project saved", f"Project saved to:\n{project_file}")
+        if self.current_project_file == project_file:
+            self.dataset_log.append(f"Project saved: {project_file}")
 
     def open_project(self) -> None:
         """Open a saved project file and restore UI settings."""
@@ -1538,6 +1548,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open failed", f"Could not open project:\n{exc}")
             return
+        self.current_project_file = Path(project_file)
         self.project_state.setText("Project opened")
         self.dataset_log.append(f"Opened project: {project_file}")
 
@@ -1711,6 +1722,65 @@ class MainWindow(QMainWindow):
         self.chat_repeat_penalty.setValue(float(chat.get("repeat_penalty", self.chat_repeat_penalty.value())))
         self.system_prompt.setPlainText(str(chat.get("system_prompt", "")))
         self._update_tokenizer_strategy_controls()
+        self._restore_artifact_status(data.get("artifacts", {}))
+
+    def _restore_artifact_status(self, artifacts: dict[str, Any]) -> None:
+        """Refresh top-bar and button state from saved or existing artifacts.
+
+        Args:
+            artifacts: Saved artifact summary dictionary.
+        """
+
+        dataset_dir = Path(self.dataset_dir.text()) if self.dataset_dir.text().strip() else None
+        if dataset_dir and self._dataset_artifacts_exist(dataset_dir):
+            summary = self._read_json_if_exists(dataset_dir / "dataset_summary.json") or artifacts.get("dataset_summary") or {}
+            document_count = int(summary.get("document_count", 0) or 0)
+            token_count = int(summary.get("token_count", 0) or 0)
+            code_count = int(summary.get("code_sample_count", 0) or 0)
+            prose_count = int(summary.get("prose_sample_count", 0) or 0)
+            vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
+            self.prepare_button.setText("DataSet Prepared")
+            self.dataset_progress.setValue(100)
+            if vocab_size:
+                self.auto_vocab_label.setText(f"{vocab_size:,}")
+            if code_count or prose_count:
+                self.dataset_status.setText(f"Dataset: {code_count:,} code, {prose_count:,} prose, {token_count:,} tokens")
+            elif document_count or token_count:
+                self.dataset_status.setText(f"Dataset: {document_count:,} files, {token_count:,} tokens")
+            else:
+                self.dataset_status.setText("Dataset: prepared")
+            self.train_data_dir.setText(str(dataset_dir))
+            self.dataset_log.append(f"Dataset already prepared: {dataset_dir}")
+        else:
+            self.prepare_button.setText("Prepare Dataset")
+            self.dataset_progress.setValue(0)
+            self.dataset_status.setText("Dataset: not prepared")
+            self.auto_vocab_label.setText("Auto after reading files")
+
+        model_dir = Path(self.model_dir.text()) if self.model_dir.text().strip() else None
+        if model_dir and (model_dir / "final_model.pt").exists():
+            summary = self._read_json_if_exists(model_dir / "training_summary.json") or artifacts.get("training_summary") or {}
+            loss = summary.get("final_train_loss")
+            self.train_status.setText(f"Training: loss {float(loss):.4f}" if loss is not None else "Training: model ready")
+            self.export_model_dir.setText(str(model_dir))
+
+        export_dir = Path(self.export_dir.text()) if self.export_dir.text().strip() else None
+        if export_dir and export_dir.exists() and any(export_dir.iterdir()):
+            self.export_status.setText("Export: artifacts found")
+
+    @staticmethod
+    def _dataset_artifacts_exist(dataset_dir: Path) -> bool:
+        """Return whether a dataset folder has the required prepared files.
+
+        Args:
+            dataset_dir: Dataset folder.
+
+        Returns:
+            True if required dataset artifacts exist.
+        """
+
+        required = ("tokenizer.json", "train_tokens.json", "val_tokens.json")
+        return dataset_dir.exists() and all((dataset_dir / name).exists() for name in required)
 
     @staticmethod
     def _safe_project_name(project_name: str) -> str:
@@ -1820,13 +1890,25 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(on_finished)
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(lambda message: self._task_failed(message, log, progress_bar))
+        self.worker.failed.connect(self._task_failed_from_worker)
         self.worker.failed.connect(self.worker.deleteLater)
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(self._thread_finished)
         self.progress_timer.start(100)
         self.thread.start()
+
+    @Slot(str)
+    def _task_failed_from_worker(self, message: str) -> None:
+        """Handle a worker failure on the UI thread.
+
+        Args:
+            message: Error message emitted by the worker.
+        """
+
+        if self.active_log is None or self.active_progress_bar is None:
+            return
+        self._task_failed(message, self.active_log, self.active_progress_bar)
 
     def stop_active_task(self) -> None:
         """Request a graceful stop for the active background task."""
@@ -1838,6 +1920,23 @@ class MainWindow(QMainWindow):
             self.active_log.append("Stop requested. Finishing the current safe point...")
         if self.active_stop_button is not None:
             self.active_stop_button.setEnabled(False)
+
+    @Slot()
+    def request_shutdown_from_signal(self) -> None:
+        """Handle Ctrl+C from a terminal without leaving Qt threads wedged."""
+
+        self.interrupt_count += 1
+        if self.interrupt_count > 1:
+            os._exit(130)
+        if self.stop_event is not None:
+            self.stop_event.set()
+        if self.active_log is not None:
+            self.active_log.append("Interrupt received. Requesting stop...")
+        self.project_state.setText("Stopping")
+        if self.thread is None:
+            QApplication.quit()
+            return
+        QTimer.singleShot(3000, lambda: os._exit(130) if self.thread is not None else QApplication.quit())
 
     def _handle_progress(self, event: object, log: QTextEdit, progress_bar: QProgressBar) -> None:
         """Apply one progress event to UI widgets.
@@ -1903,7 +2002,8 @@ class MainWindow(QMainWindow):
         """Clean up thread bookkeeping after a worker finishes."""
 
         self._drain_progress_queue()
-        self.progress_timer.stop()
+        if self.progress_timer.isActive():
+            self.progress_timer.stop()
         self.thread = None
         self.worker = None
         self.stop_event = None
@@ -1951,7 +2051,8 @@ class MainWindow(QMainWindow):
             final_text: Optional final button text.
         """
 
-        self.spinner_timer.stop()
+        if self.spinner_timer.isActive():
+            self.spinner_timer.stop()
         if self.active_button:
             self.active_button.setEnabled(True)
             self.active_button.setText(final_text or self.active_button_restore_text)
@@ -2010,6 +2111,7 @@ class MainWindow(QMainWindow):
             busy_text="Preparing Dataset",
         )
 
+    @Slot(object)
     def _dataset_finished(self, result: Any) -> None:
         """Update UI after dataset preparation finishes.
 
@@ -2134,6 +2236,7 @@ class MainWindow(QMainWindow):
             busy_text="Training",
         )
 
+    @Slot(object)
     def _training_finished(self, result: Any) -> None:
         """Update UI after training finishes.
 
@@ -2186,6 +2289,7 @@ class MainWindow(QMainWindow):
             busy_text="Loading Model",
         )
 
+    @Slot(object)
     def _llm_loaded(self, session: Any) -> None:
         """Store a loaded GGUF chat session.
 
@@ -2266,6 +2370,7 @@ class MainWindow(QMainWindow):
             busy_text="Thinking",
         )
 
+    @Slot(object)
     def _chat_reply_finished(self, reply: Any) -> None:
         """Render the model reply.
 
@@ -2383,6 +2488,11 @@ def main() -> None:
     window = MainWindow()
     window.show()
     QTimer.singleShot(0, window.apply_windows_taskbar_icon)
+    interrupt_timer = QTimer()
+    interrupt_timer.timeout.connect(lambda: None)
+    interrupt_timer.start(200)
+    window.interrupt_timer = interrupt_timer
+    signal.signal(signal.SIGINT, lambda *_: QTimer.singleShot(0, window.request_shutdown_from_signal))
     sys.exit(app.exec())
 
 

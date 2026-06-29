@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable, Iterator, Optional
 
 from tokenizers import Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
@@ -22,6 +23,7 @@ def train_tokenizer(
     output_path: Path,
     vocab_size: int = 8000,
     min_frequency: int = 2,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Tokenizer:
     """Train a byte-level BPE tokenizer.
 
@@ -30,6 +32,7 @@ def train_tokenizer(
         output_path: Destination tokenizer JSON path.
         vocab_size: Target vocabulary size.
         min_frequency: Minimum token frequency for BPE merges.
+        should_stop: Optional callback returning true when training should stop.
 
     Returns:
         Trained tokenizer instance.
@@ -46,7 +49,7 @@ def train_tokenizer(
         initial_alphabet=ByteLevel.alphabet(),
         show_progress=True,
     )
-    tokenizer.train([str(corpus_path)], trainer)
+    tokenizer.train_from_iterator(_iter_corpus_lines(corpus_path, should_stop), trainer=trainer)
     tokenizer.post_processor = TemplateProcessing(
         single=f"{BOS_TOKEN} $A {EOS_TOKEN}",
         special_tokens=[
@@ -58,6 +61,27 @@ def train_tokenizer(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(output_path))
     return tokenizer
+
+
+def _iter_corpus_lines(corpus_path: Path, should_stop: Optional[Callable[[], bool]]) -> Iterator[str]:
+    """Yield corpus lines and check for cancellation between chunks.
+
+    Args:
+        corpus_path: Text corpus path.
+        should_stop: Optional cancellation callback.
+
+    Yields:
+        Corpus text lines.
+
+    Raises:
+        RuntimeError: If cancellation is requested.
+    """
+
+    with corpus_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if should_stop and should_stop():
+                raise RuntimeError("Dataset preparation stopped by user.")
+            yield line
 
 
 def load_tokenizer(path: Path) -> Tokenizer:

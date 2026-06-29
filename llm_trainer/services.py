@@ -140,6 +140,7 @@ def _load_or_create_tokenizer(
     tokenizer_path: Path,
     selected_vocab_size: int,
     progress: Optional[Callable[[Any], None]],
+    should_stop: Optional[Callable[[], bool]],
 ) -> tuple[Any, bool, bool, Optional[str]]:
     """Load, import, or train a tokenizer for the prepared corpus.
 
@@ -149,6 +150,7 @@ def _load_or_create_tokenizer(
         tokenizer_path: Dataset tokenizer output path.
         selected_vocab_size: Vocabulary size used when training a new tokenizer.
         progress: Optional progress callback.
+        should_stop: Optional cancellation callback.
 
     Returns:
         Tokenizer, reused flag, imported flag, and optional source path.
@@ -180,6 +182,7 @@ def _load_or_create_tokenizer(
         tokenizer_path,
         vocab_size=selected_vocab_size,
         min_frequency=config.min_frequency,
+        should_stop=should_stop,
     )
     return tokenizer, False, imported, source_path
 
@@ -386,6 +389,7 @@ def build_dataset(
         tokenizer_path,
         selected_vocab_size,
         progress,
+        should_stop,
     )
 
     _emit(progress, "Encoding corpus into token IDs...", 78)
