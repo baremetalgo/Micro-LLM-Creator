@@ -26,6 +26,7 @@ class DatasetConfig:
         extract_code_blocks: Detects code-like blocks in PDFs/text.
         preserve_indentation: Keeps code line breaks and indentation.
         generate_instruction_samples: Wraps code with simple instruction tags.
+        reasoning_sample_mode: Instruction/reasoning format: none, scaffold, or detailed.
         prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
         tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
         tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
@@ -45,6 +46,7 @@ class DatasetConfig:
     extract_code_blocks: bool = True
     preserve_indentation: bool = True
     generate_instruction_samples: bool = True
+    reasoning_sample_mode: str = "scaffold"
     prepare_mode: str = "incremental"
     tokenizer_strategy: str = "auto"
     tokenizer_path: Optional[Path] = None
@@ -62,6 +64,10 @@ class ModelConfig:
         layer_count: Number of transformer blocks.
         dropout: Dropout probability for regularization.
         bias: Whether linear and normalization layers include bias terms.
+        norm_type: Normalization type: layernorm or rmsnorm.
+        position_encoding: Position encoding type: learned or rope.
+        mlp_type: Feed-forward type: gelu or swiglu.
+        rope_theta: RoPE frequency base when position_encoding is rope.
     """
 
     vocab_size: int
@@ -71,6 +77,10 @@ class ModelConfig:
     layer_count: int = 4
     dropout: float = 0.1
     bias: bool = True
+    norm_type: str = "layernorm"
+    position_encoding: str = "learned"
+    mlp_type: str = "gelu"
+    rope_theta: float = 10000.0
 
     def validate(self) -> None:
         """Validate architecture constraints.
@@ -85,6 +95,16 @@ class ModelConfig:
             raise ValueError("context_length must be at least 8")
         if self.vocab_size < 16:
             raise ValueError("vocab_size is too small for language modeling")
+        if self.norm_type not in {"layernorm", "rmsnorm"}:
+            raise ValueError("norm_type must be layernorm or rmsnorm")
+        if self.position_encoding not in {"learned", "rope"}:
+            raise ValueError("position_encoding must be learned or rope")
+        if self.mlp_type not in {"gelu", "swiglu"}:
+            raise ValueError("mlp_type must be gelu or swiglu")
+        if self.position_encoding == "rope":
+            head_size = self.embedding_size // self.head_count
+            if head_size % 2 != 0:
+                raise ValueError("RoPE requires an even attention head size")
 
 
 @dataclass
@@ -107,6 +127,7 @@ class TrainingConfig:
         seed: Random seed for repeatability.
         resume: Whether to resume from checkpoints.
         resume_from_checkpoint: Optional exact checkpoint path to resume from.
+        require_compatible_resume: Validate tokenizer/model compatibility before resuming.
     """
 
     output_dir: Path
@@ -124,6 +145,7 @@ class TrainingConfig:
     seed: int = 1337
     resume: bool = True
     resume_from_checkpoint: Optional[Path] = None
+    require_compatible_resume: bool = True
 
 
 def dataclass_to_jsonable(value: Any) -> dict[str, Any]:

@@ -396,6 +396,7 @@ def expand_code_documents(
 def format_document_for_training(
     document: Document,
     generate_instruction_samples: bool = True,
+    reasoning_sample_mode: str = "scaffold",
 ) -> str:
     """Format a document with tags for the training corpus.
 
@@ -403,6 +404,7 @@ def format_document_for_training(
         document: Document to serialize.
         generate_instruction_samples: Whether code samples should include a
             simple instruction wrapper.
+        reasoning_sample_mode: Instruction/reasoning style: none, scaffold, or detailed.
 
     Returns:
         Tagged training text for the document.
@@ -412,14 +414,74 @@ def format_document_for_training(
     if document.kind == "code":
         language = document.language or "unknown"
         if generate_instruction_samples:
-            return (
-                f"<sample type=\"code\" language=\"{language}\" source=\"{source}\">\n"
-                f"<instruction>Study this {language} code and learn its syntax, structure, and patterns.</instruction>\n"
-                f"<code>\n{document.text}\n</code>\n"
-                f"</sample>"
-            )
+            return format_code_instruction_sample(document, language, source, reasoning_sample_mode)
         return f"<code language=\"{language}\" source=\"{source}\">\n{document.text}\n</code>"
     return f"<sample type=\"prose\" source=\"{source}\">\n{document.text}\n</sample>"
+
+
+def format_code_instruction_sample(document: Document, language: str, source: str, reasoning_sample_mode: str) -> str:
+    """Format a code sample as an instruction/reasoning training example.
+
+    Args:
+        document: Code document.
+        language: Programming language label.
+        source: Source file name.
+        reasoning_sample_mode: Instruction/reasoning style.
+
+    Returns:
+        Tagged training text.
+    """
+
+    task = infer_code_task(document, language)
+    if reasoning_sample_mode == "none":
+        return (
+            f"<sample type=\"code\" language=\"{language}\" source=\"{source}\">\n"
+            f"<instruction>{task}</instruction>\n"
+            f"<answer>\n```{language}\n{document.text}\n```\n</answer>\n"
+            f"</sample>"
+        )
+    if reasoning_sample_mode == "detailed":
+        reasoning = (
+            "1. Identify the goal implied by the file name, function names, and surrounding code.\n"
+            "2. Inspect inputs, outputs, control flow, data structures, and error handling.\n"
+            "3. Preserve language syntax, indentation, imports, and naming style.\n"
+            "4. Produce the code first, then explain the important design choices and edge cases."
+        )
+        explanation = (
+            "This sample teaches the model to connect a programming task with implementation details, "
+            "syntax, structure, and a concise explanation."
+        )
+    else:
+        reasoning = (
+            "Understand the requested programming task, choose the relevant language patterns, "
+            "preserve correct syntax, and provide the implementation."
+        )
+        explanation = "The answer contains the implementation that satisfies the task."
+    return (
+        f"<sample type=\"reasoning_code\" language=\"{language}\" source=\"{source}\">\n"
+        f"<instruction>{task}</instruction>\n"
+        f"<reasoning>\n{reasoning}\n</reasoning>\n"
+        f"<answer>\n```{language}\n{document.text}\n```\n</answer>\n"
+        f"<explanation>{explanation}</explanation>\n"
+        f"</sample>"
+    )
+
+
+def infer_code_task(document: Document, language: str) -> str:
+    """Infer a simple task instruction for a code sample.
+
+    Args:
+        document: Code document.
+        language: Programming language label.
+
+    Returns:
+        Task instruction text.
+    """
+
+    stem = document.path.stem.replace("_", " ").replace("-", " ").strip()
+    if stem and stem.lower() not in {"index", "main", "app"}:
+        return f"Write or explain the {language} code for {stem}."
+    return f"Write or explain this {language} code with correct syntax and structure."
 
 
 def load_documents(
@@ -516,6 +578,7 @@ def write_training_corpus(
     output_path: Path,
     code_training_mode: bool = False,
     generate_instruction_samples: bool = True,
+    reasoning_sample_mode: str = "scaffold",
 ) -> None:
     """Write loaded samples into a tokenizer training corpus.
 
@@ -525,13 +588,20 @@ def write_training_corpus(
         code_training_mode: Whether to use code/prose tags.
         generate_instruction_samples: Whether to wrap code samples with
             instruction text.
+        reasoning_sample_mode: Instruction/reasoning style for code samples.
     """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         for doc in documents:
             if code_training_mode:
-                file.write(format_document_for_training(doc, generate_instruction_samples=generate_instruction_samples))
+                file.write(
+                    format_document_for_training(
+                        doc,
+                        generate_instruction_samples=generate_instruction_samples,
+                        reasoning_sample_mode=reasoning_sample_mode,
+                    )
+                )
             else:
                 file.write(doc.text)
             file.write("\n")

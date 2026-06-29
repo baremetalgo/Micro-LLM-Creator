@@ -40,6 +40,7 @@ def generate_text(
     temperature: float = 0.8,
     top_k: Optional[int] = 50,
     device: Optional[str] = None,
+    use_kv_cache: bool = True,
 ) -> str:
     """Generate text from a trained checkpoint.
 
@@ -51,6 +52,7 @@ def generate_text(
         temperature: Sampling temperature.
         top_k: Optional top-k sampling cutoff.
         device: Optional device override.
+        use_kv_cache: Whether to use key/value cache during generation.
 
     Returns:
         Decoded generated text.
@@ -61,7 +63,7 @@ def generate_text(
     model = load_model_from_checkpoint(checkpoint_path, device=device)
     input_ids = tokenizer.encode(prompt).ids
     context = torch.tensor([input_ids], dtype=torch.long, device=device)
-    generated = model.generate(context, max_new_tokens, temperature=temperature, top_k=top_k)
+    generated = model.generate(context, max_new_tokens, temperature=temperature, top_k=top_k, use_kv_cache=use_kv_cache)
     eos_id = token_id(tokenizer, EOS_TOKEN)
     output_ids = generated[0].tolist()
     if eos_id in output_ids[len(input_ids) :]:

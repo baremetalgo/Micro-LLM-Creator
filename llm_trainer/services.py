@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import torch
+
 from .config import DatasetConfig, ModelConfig, TrainingConfig, dataclass_to_jsonable
 from .data import (
     document_from_dict,
@@ -16,8 +18,9 @@ from .data import (
     supported_source_paths,
     write_training_corpus,
 )
-from .tokenizer import PAD_TOKEN, encode_text, load_tokenizer, token_id, train_tokenizer
-from .training import TrainingResult, split_tokens, train_model
+from .lineage import read_json, record_dataset_version, stable_json_hash, utc_timestamp, write_json
+from .tokenizer import PAD_TOKEN, encode_text, load_tokenizer, token_id, train_tokenizer, validate_training_tokenizer
+from .training import TrainingResult, latest_checkpoint, split_tokens, train_model
 
 
 @dataclass
@@ -37,6 +40,8 @@ class DatasetBuildResult:
         prose_sample_count: Number of prose samples.
         cached_file_count: Number of unchanged source files reused from cache.
         processed_file_count: Number of source files extracted this run.
+        dataset_version_id: Unique dataset version identifier.
+        dataset_version_number: One-based dataset version number.
     """
 
     output_dir: Path
@@ -51,6 +56,8 @@ class DatasetBuildResult:
     prose_sample_count: int = 0
     cached_file_count: int = 0
     processed_file_count: int = 0
+    dataset_version_id: str = ""
+    dataset_version_number: int = 0
 
 
 def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
@@ -205,6 +212,8 @@ def _cache_key(config: DatasetConfig) -> str:
             "include_source_code": config.include_source_code,
             "extract_code_blocks": config.extract_code_blocks,
             "preserve_indentation": config.preserve_indentation,
+            "generate_instruction_samples": config.generate_instruction_samples,
+            "reasoning_sample_mode": config.reasoning_sample_mode,
         },
         sort_keys=True,
     )
@@ -379,6 +388,7 @@ def build_dataset(
         corpus_path,
         code_training_mode=config.code_training_mode,
         generate_instruction_samples=config.generate_instruction_samples,
+        reasoning_sample_mode=config.reasoning_sample_mode,
     )
     tokenizer_path = config.output_dir / "tokenizer.json"
     if should_stop and should_stop():
@@ -391,6 +401,7 @@ def build_dataset(
         progress,
         should_stop,
     )
+    validate_training_tokenizer(tokenizer)
 
     _emit(progress, "Encoding corpus into token IDs...", 78)
     if should_stop and should_stop():
@@ -411,18 +422,22 @@ def build_dataset(
         "prose_sample_count": prose_sample_count,
         "suggested_vocab_size": suggested_vocab_size,
         "tokenizer_vocab_size": tokenizer.get_vocab_size(),
+        "tokenizer_sha256": file_sha256(tokenizer_path),
         "warning": warning,
         "source_files": [str(doc.path) for doc in documents],
         "cached_file_count": cached_file_count,
         "processed_file_count": processed_file_count,
         "prepare_mode": config.prepare_mode,
         "tokenizer_strategy": config.tokenizer_strategy,
+        "reasoning_sample_mode": config.reasoning_sample_mode,
         "tokenizer_reused": reuse_tokenizer,
         "tokenizer_imported": tokenizer_imported,
         "tokenizer_source_path": tokenizer_source_path,
     }
-    (config.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    (config.output_dir / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    dataset_version = record_dataset_version(config.output_dir, summary, manifest)
+    write_json(config.output_dir / "dataset_summary.json", summary)
+    write_json(config.output_dir / "dataset_manifest.json", manifest)
+    _emit(progress, f"Dataset version recorded: {dataset_version['version_id']}.", 98)
     _emit(progress, f"Dataset ready: {config.output_dir}", 100)
     return DatasetBuildResult(
         config.output_dir,
@@ -437,7 +452,133 @@ def build_dataset(
         prose_sample_count,
         cached_file_count,
         processed_file_count,
+        str(dataset_version["version_id"]),
+        int(dataset_version["version_number"]),
     )
+
+
+def _resume_checkpoint_for(training_config: TrainingConfig) -> Optional[Path]:
+    """Return the checkpoint that will be used for resume, if any.
+
+    Args:
+        training_config: Training configuration.
+
+    Returns:
+        Resume checkpoint path or ``None``.
+    """
+
+    if not training_config.resume:
+        return None
+    if training_config.resume_from_checkpoint:
+        return Path(training_config.resume_from_checkpoint)
+    return latest_checkpoint(training_config.output_dir / "checkpoints")
+
+
+def _compatible_model_config(model_config: ModelConfig) -> dict[str, Any]:
+    """Return checkpoint compatibility fields for a model config.
+
+    Args:
+        model_config: Current model configuration.
+
+    Returns:
+        Dictionary of architecture-shape fields.
+    """
+
+    data = dataclass_to_jsonable(model_config)
+    return {
+        key: data.get(key)
+        for key in (
+            "vocab_size",
+            "context_length",
+            "embedding_size",
+            "head_count",
+            "layer_count",
+            "bias",
+            "norm_type",
+            "position_encoding",
+            "mlp_type",
+            "rope_theta",
+        )
+    }
+
+
+def _tokenizer_files_match(left: Path, right: Path) -> bool:
+    """Return whether tokenizer files are byte-identical or JSON-equivalent.
+
+    Args:
+        left: First tokenizer path.
+        right: Second tokenizer path.
+
+    Returns:
+        True when tokenizers are compatible.
+    """
+
+    if file_sha256(left) == file_sha256(right):
+        return True
+    left_json = read_json(left, default=None)
+    right_json = read_json(right, default=None)
+    return left_json is not None and left_json == right_json
+
+
+def _validate_resume_compatibility(
+    data_dir: Path,
+    tokenizer_path: Path,
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+) -> Optional[Path]:
+    """Validate tokenizer and architecture before continuing training.
+
+    Args:
+        data_dir: Prepared dataset folder.
+        tokenizer_path: Dataset tokenizer path.
+        model_config: Current model architecture.
+        training_config: Training configuration.
+
+    Returns:
+        Resume checkpoint path when one exists.
+
+    Raises:
+        ValueError: If tokenizer or architecture is incompatible.
+    """
+
+    resume_path = _resume_checkpoint_for(training_config)
+    if not resume_path or not resume_path.exists() or not training_config.require_compatible_resume:
+        return resume_path
+
+    existing_tokenizer = training_config.output_dir / "tokenizer.json"
+    if existing_tokenizer.exists():
+        if not _tokenizer_files_match(existing_tokenizer, tokenizer_path):
+            raise ValueError(
+                "Resume safety check failed: the selected dataset tokenizer does not match the tokenizer "
+                f"used by the existing model folder.\nExisting tokenizer: {existing_tokenizer}\n"
+                f"Dataset tokenizer: {tokenizer_path}\n\nUse the same tokenizer policy for continued training, "
+                "or choose a new model output folder to start a new model."
+            )
+
+    checkpoint = torch.load(resume_path, map_location="cpu")
+    checkpoint_config = checkpoint.get("model_config")
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError(f"Resume safety check failed: checkpoint has no model_config: {resume_path}")
+
+    current = _compatible_model_config(model_config)
+    previous = {key: checkpoint_config.get(key) for key in current}
+    mismatches = {
+        key: {"checkpoint": previous.get(key), "current": current.get(key)}
+        for key in current
+        if previous.get(key) != current.get(key)
+    }
+    if mismatches:
+        mismatch_text = ", ".join(
+            f"{key} checkpoint={value['checkpoint']} current={value['current']}"
+            for key, value in mismatches.items()
+        )
+        raise ValueError(
+            "Resume safety check failed: model architecture does not match the checkpoint. "
+            f"{mismatch_text}. Keep architecture settings identical for continued training, "
+            "or use a new model output folder."
+        )
+
+    return resume_path
 
 
 def train_from_dataset(
@@ -469,7 +610,10 @@ def train_from_dataset(
 
     from .tokenizer import load_tokenizer
 
+    dataset_summary = read_json(data_dir / "dataset_summary.json", default={}) or {}
+    dataset_lineage = read_json(data_dir / "dataset_lineage.json", default={}) or {}
     tokenizer = load_tokenizer(tokenizer_path)
+    validate_training_tokenizer(tokenizer)
     train_tokens = json.loads((data_dir / "train_tokens.json").read_text(encoding="utf-8"))
     val_tokens = json.loads((data_dir / "val_tokens.json").read_text(encoding="utf-8"))
 
@@ -477,11 +621,11 @@ def train_from_dataset(
         model_config.vocab_size = tokenizer.get_vocab_size()
 
     training_config.output_dir.mkdir(parents=True, exist_ok=True)
-    (training_config.output_dir / "tokenizer.json").write_text(
-        tokenizer_path.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    return train_model(
+    resume_path = _validate_resume_compatibility(data_dir, tokenizer_path, model_config, training_config)
+    if resume_path:
+        _emit(progress, f"Resume safety check passed: {resume_path}", 3)
+    shutil.copy2(tokenizer_path, training_config.output_dir / "tokenizer.json")
+    result = train_model(
         model_config,
         training_config,
         train_tokens,
@@ -490,3 +634,29 @@ def train_from_dataset(
         progress=progress,
         should_stop=should_stop,
     )
+    training_summary = read_json(result.summary_path, default={}) or {}
+    run_id = f"run_{utc_timestamp()}_{stable_json_hash({'dataset': dataset_summary.get('dataset_version'), 'model': training_summary.get('model_config'), 'training': training_summary.get('training_config')})}"
+    lineage = {
+        "schema": "micro_llm_model_lineage",
+        "version": 1,
+        "training_run_id": run_id,
+        "created_at": utc_timestamp(),
+        "dataset_dir": str(data_dir),
+        "dataset_id": dataset_summary.get("dataset_id") or dataset_lineage.get("dataset_id"),
+        "dataset_version": dataset_summary.get("dataset_version"),
+        "dataset_fingerprint": (dataset_summary.get("dataset_version") or {}).get("source_fingerprint"),
+        "tokenizer_path": str(tokenizer_path),
+        "tokenizer_vocab_size": tokenizer.get_vocab_size(),
+        "tokenizer_sha256": file_sha256(tokenizer_path),
+        "resume_checkpoint": str(resume_path) if resume_path else None,
+        "resume_safety_required": training_config.require_compatible_resume,
+        "checkpoint_path": str(result.checkpoint_path),
+        "summary_path": str(result.summary_path),
+        "stopped": result.stopped,
+    }
+    training_summary["training_run_id"] = run_id
+    training_summary["model_lineage"] = lineage
+    write_json(result.summary_path, training_summary)
+    write_json(training_config.output_dir / "model_lineage.json", lineage)
+    write_json(training_config.output_dir / "dataset_summary.json", dataset_summary)
+    return result

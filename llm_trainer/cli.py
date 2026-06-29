@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
 
 from .config import DatasetConfig, ModelConfig, TrainingConfig
-from .services import build_dataset
-from .tokenizer import PAD_TOKEN, load_tokenizer, token_id
-from .training import train_model
+from .evaluation import evaluate_checkpoint, normalize_prompts
+from .export import export_hf_microgpt_package
+from .services import build_dataset, train_from_dataset
+from .tokenizer import load_tokenizer
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -50,6 +50,7 @@ def prepare(args: argparse.Namespace) -> None:
         extract_code_blocks=not args.no_extract_code_blocks,
         preserve_indentation=not args.no_preserve_indentation,
         generate_instruction_samples=not args.no_instruction_samples,
+        reasoning_sample_mode=args.reasoning_sample_mode,
         prepare_mode=args.prepare_mode,
         tokenizer_strategy=args.tokenizer_strategy,
         tokenizer_path=Path(args.tokenizer_path) if args.tokenizer_path else None,
@@ -71,8 +72,6 @@ def train(args: argparse.Namespace) -> None:
 
     data_dir = Path(args.data_dir)
     tokenizer = load_tokenizer(data_dir / "tokenizer.json")
-    train_tokens = json.loads((data_dir / "train_tokens.json").read_text(encoding="utf-8"))
-    val_tokens = json.loads((data_dir / "val_tokens.json").read_text(encoding="utf-8"))
 
     model_config = ModelConfig(
         vocab_size=tokenizer.get_vocab_size(),
@@ -81,6 +80,10 @@ def train(args: argparse.Namespace) -> None:
         head_count=args.head_count,
         layer_count=args.layer_count,
         dropout=args.dropout,
+        norm_type=args.norm_type,
+        position_encoding=args.position_encoding,
+        mlp_type=args.mlp_type,
+        rope_theta=args.rope_theta,
     )
     training_config = TrainingConfig(
         output_dir=Path(args.output_dir),
@@ -94,21 +97,48 @@ def train(args: argparse.Namespace) -> None:
         device=args.device,
         resume=not args.no_resume,
         resume_from_checkpoint=Path(args.resume_checkpoint) if args.resume_checkpoint else None,
+        require_compatible_resume=not args.no_resume_safety,
     )
-    training_config.output_dir.mkdir(parents=True, exist_ok=True)
-    (training_config.output_dir / "tokenizer.json").write_text(
-        (data_dir / "tokenizer.json").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    result = train_model(
-        model_config,
-        training_config,
-        train_tokens,
-        val_tokens,
-        pad_token_id=token_id(tokenizer, PAD_TOKEN),
-    )
+    result = train_from_dataset(data_dir, model_config, training_config)
     print(f"Saved model: {result.checkpoint_path}")
     print(f"Saved summary: {result.summary_path}")
+
+
+def benchmark(args: argparse.Namespace) -> None:
+    """Run benchmark prompts against a trained checkpoint.
+
+    Args:
+        args: Parsed command-line arguments for the benchmark command.
+    """
+
+    prompts = normalize_prompts(Path(args.prompts_file).read_text(encoding="utf-8") if args.prompts_file else args.prompts)
+    result = evaluate_checkpoint(
+        Path(args.model_dir),
+        prompts,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        device=args.device,
+        use_kv_cache=not args.no_kv_cache,
+    )
+    print(f"Benchmark prompts: {result.prompt_count}")
+    print(f"Benchmark time: {result.total_seconds:.2f}s")
+    print(f"Saved benchmark: {result.output_path}")
+
+
+def export_hf(args: argparse.Namespace) -> None:
+    """Export a MicroGPT checkpoint as an HF-style package.
+
+    Args:
+        args: Parsed command-line arguments for the export-hf command.
+    """
+
+    output = export_hf_microgpt_package(
+        Path(args.model_dir),
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+    )
+    print(f"Saved HF-style MicroGPT package: {output}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,6 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--no_preserve_indentation", action="store_true")
     prepare_parser.add_argument("--no_instruction_samples", action="store_true")
     prepare_parser.add_argument(
+        "--reasoning_sample_mode",
+        choices=["none", "scaffold", "detailed"],
+        default="scaffold",
+    )
+    prepare_parser.add_argument(
         "--prepare_mode",
         choices=["incremental", "full_rebuild", "force_reprocess"],
         default="incremental",
@@ -159,6 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--head_count", type=int, default=4)
     train_parser.add_argument("--layer_count", type=int, default=4)
     train_parser.add_argument("--dropout", type=float, default=0.1)
+    train_parser.add_argument("--norm_type", choices=["layernorm", "rmsnorm"], default="layernorm")
+    train_parser.add_argument("--position_encoding", choices=["learned", "rope"], default="learned")
+    train_parser.add_argument("--mlp_type", choices=["gelu", "swiglu"], default="gelu")
+    train_parser.add_argument("--rope_theta", type=float, default=10000.0)
     train_parser.add_argument("--learning_rate", type=float, default=3e-4)
     train_parser.add_argument("--gradient_accumulation", type=int, default=1)
     train_parser.add_argument("--eval_interval", type=int, default=100)
@@ -167,7 +206,25 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train_parser.add_argument("--no_resume", action="store_true")
     train_parser.add_argument("--resume_checkpoint", default=None)
+    train_parser.add_argument("--no_resume_safety", action="store_true")
     train_parser.set_defaults(func=train)
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Run fixed prompts against a trained model")
+    benchmark_parser.add_argument("--model_dir", required=True)
+    benchmark_parser.add_argument("--prompts", default="")
+    benchmark_parser.add_argument("--prompts_file", default=None)
+    benchmark_parser.add_argument("--output_dir", default=None)
+    benchmark_parser.add_argument("--max_new_tokens", type=int, default=128)
+    benchmark_parser.add_argument("--temperature", type=float, default=0.7)
+    benchmark_parser.add_argument("--top_k", type=int, default=50)
+    benchmark_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    benchmark_parser.add_argument("--no_kv_cache", action="store_true")
+    benchmark_parser.set_defaults(func=benchmark)
+
+    export_hf_parser = subparsers.add_parser("export-hf", help="Export a MicroGPT model as an HF-style package")
+    export_hf_parser.add_argument("--model_dir", required=True)
+    export_hf_parser.add_argument("--output_dir", default=None)
+    export_hf_parser.set_defaults(func=export_hf)
     return parser
 
 

@@ -124,11 +124,38 @@ The app writes:
 - `train_tokens.json`
 - `val_tokens.json`
 - `dataset_summary.json`
+- `dataset_lineage.json`
+- `versions/<version_id>/dataset_summary.json`
+- `versions/<version_id>/dataset_manifest.json`
 
 Effect on the LLM:
 
 - This folder becomes the training source for the `AI` tab.
 - Reusing the same dataset keeps experiments comparable.
+- Each preparation run records a dataset version so you can trace which data
+  produced which model.
+
+### Dataset Versions
+
+Every successful preparation creates a dataset version such as:
+
+```text
+v001_20260629T120000Z_a1b2c3d4e5f6
+```
+
+The version records:
+
+- source file hashes
+- preparation settings
+- tokenizer policy
+- tokenizer SHA-256 hash
+- token counts
+- code/prose counts
+- manifest snapshot
+
+When a model is trained, the training output records the dataset version in
+`model_lineage.json` and `training_summary.json`. This is important because it
+lets you answer: "Which exact data produced this checkpoint?"
 
 ### Parallel Lanes
 
@@ -182,6 +209,12 @@ Effect on the LLM:
   checkpoints are no longer compatible because token IDs may change.
 - Imported tokenizers are useful for professional workflows where multiple
   datasets share the same vocabulary.
+
+Compatibility requirement:
+
+- A training tokenizer must contain `<pad>`, `<unk>`, `<bos>`, and `<eos>`.
+- The app validates imported/reused tokenizers during dataset preparation.
+- The app records `tokenizer_sha256` in dataset and model lineage.
 
 ### Lowercase Text
 
@@ -271,15 +304,22 @@ Wraps code in simple instruction tags.
 
 Example:
 
-```text
-<sample type="code" language="python" source="example.py">
-<instruction>Study this python code and learn its syntax, structure, and patterns.</instruction>
-<code>
+````text
+<sample type="reasoning_code" language="python" source="example.py">
+<instruction>Write or explain the python code for example.</instruction>
+<reasoning>
+Understand the requested programming task, choose the relevant language patterns,
+preserve correct syntax, and provide the implementation.
+</reasoning>
+<answer>
+```python
 def hello():
     return "hi"
-</code>
-</sample>
 ```
+</answer>
+<explanation>The answer contains the implementation that satisfies the task.</explanation>
+</sample>
+````
 
 Effect:
 
@@ -289,6 +329,30 @@ Effect:
 Recommendation:
 
 - Keep enabled for general coding assistant behavior.
+
+### Reasoning Samples
+
+Controls how code instruction samples are shaped.
+
+- `Reasoning scaffold`: adds short task, reasoning, answer, and explanation
+  sections. This is the default.
+- `Detailed code reasoning`: adds a more explicit checklist around goal,
+  inputs, outputs, control flow, data structures, syntax, and edge cases.
+- `No reasoning wrapper`: keeps a simpler instruction plus answer format.
+
+Effect:
+
+- Helps the model learn a response structure similar to coding assistants.
+- Helps prompts like "explain", "review", "fix", or "write code" produce more
+  organized answers.
+- Does not magically create deep reasoning; for that, you still need many
+  high-quality examples with real problem-solving traces.
+
+Recommendation:
+
+- Use `Reasoning scaffold` for most code datasets.
+- Use `Detailed code reasoning` when training specifically for explanation,
+  debugging, and code review behavior.
 
 ### Auto Vocabulary
 
@@ -388,7 +452,12 @@ Includes:
 - `final_model.pt`
 - `tokenizer.json`
 - `training_summary.json`
+- `model_lineage.json`
 - `checkpoints/`
+
+`model_lineage.json` records the training run ID, source dataset folder,
+dataset ID, dataset version, tokenizer size, resume checkpoint, compatibility
+safety setting, and checkpoint path.
 
 ### Preset
 
@@ -397,6 +466,30 @@ Quick architecture presets.
 - `Tiny`: faster, lower quality, good for testing.
 - `Small`: more capacity, needs more data and memory.
 - `Custom`: use your own values.
+
+### Block Style
+
+Core transformer block design.
+
+- `Classic GPT`: uses learned positional embeddings, LayerNorm, and GELU MLP.
+  This is the original Micro LLM Creator architecture and is best for old
+  checkpoints.
+- `Llama-like`: uses RoPE positional encoding, RMSNorm, and SwiGLU MLP. This is
+  closer to modern Llama-style model blocks and is the better default for new
+  serious experiments.
+
+Effect:
+
+- `Classic GPT` is simple and stable for tiny tests.
+- `Llama-like` usually gives better inductive bias for longer context and modern
+  decoder-only language modeling.
+- Checkpoints are not interchangeable between block styles.
+
+Recommendation:
+
+- Use `Llama-like` for new models.
+- Use `Classic GPT` when resuming older checkpoints created before this option
+  existed.
 
 ### n_embd
 
@@ -636,6 +729,30 @@ Effect:
 
 - Loads model, optimizer, scheduler, scaler, epoch, and step state.
 - Prevents losing long training runs.
+- Also supports continued training after adding more data, as long as the
+  tokenizer and architecture stay compatible.
+
+Important:
+
+- Keep the same model output folder to continue the same model.
+- Keep the same tokenizer when adding more data.
+- Keep `n_embd`, `n_head`, `n_layer`, context length, and bias compatible with
+  the checkpoint.
+
+### Require Compatible Resume
+
+Validates continued training before loading a checkpoint.
+
+Effect:
+
+- Compares the dataset tokenizer with the tokenizer saved in the model folder.
+- Compares checkpoint architecture with the selected UI architecture.
+- Stops early with a clear message if the run would be incompatible.
+
+Recommendation:
+
+- Keep enabled for professional work.
+- Disable only when debugging old checkpoints manually.
 
 ### Resume Checkpoint
 
@@ -644,6 +761,54 @@ Optional exact checkpoint file.
 Effect:
 
 - Use this when you want to resume a specific checkpoint instead of the latest.
+
+### Benchmark Prompts
+
+Fixed prompts used to test a trained checkpoint after training.
+
+Effect:
+
+- Runs the same prompts against `final_model.pt`.
+- Saves outputs to `benchmarks/benchmark_<timestamp>.json` inside the model
+  folder.
+- Helps compare model versions beyond train/validation loss.
+
+Recommendation:
+
+- Keep a small stable set of prompts for every project.
+- Include prompts for explanation, code writing, debugging, and code review.
+- Compare benchmark outputs after each dataset version or training run.
+
+### Use KV Cache
+
+Reuses attention key/value tensors while generating benchmark answers from a
+MicroGPT checkpoint.
+
+Effect:
+
+- Speeds up autoregressive generation because the model does not recompute the
+  whole prompt for every new token.
+- Is used only for inference/benchmark generation, not training.
+- Benchmark JSON records whether KV cache was enabled.
+
+Recommendation:
+
+- Keep enabled for normal benchmark runs.
+- Disable only when debugging generation differences.
+
+Example prompts:
+
+````text
+Explain what a Python function is and give a tiny example.
+
+Write a Python function that adds two numbers.
+
+Review this code and explain any issue:
+```python
+def add(a, b):
+print(a + b)
+```
+````
 
 ## 5. Export Options
 
@@ -657,6 +822,12 @@ Must contain:
 - `tokenizer.json`
 - `training_summary.json`
 
+Optional but recommended:
+
+- `model_lineage.json`
+- `dataset_summary.json`
+- `benchmarks/`
+
 ### Output Bay
 
 Destination folder for exports.
@@ -667,7 +838,7 @@ Available now:
 
 - `FP16 checkpoint`
 
-Planned:
+Requires a real llama.cpp-compatible HF model or a custom MicroGPT converter:
 
 - `GGUF Q8_0`
 - `GGUF Q4_K_M`
@@ -682,18 +853,84 @@ GGUF note:
 
 - GGUF export should be done through a valid llama.cpp/Hugging Face-compatible
   conversion path. The app intentionally avoids writing fake GGUF files.
+- `Convert HF to GGUF` runs llama.cpp's `convert_hf_to_gguf.py` when the model
+  core contains a real `hf_model` folder.
+- Native MicroGPT checkpoints are not directly GGUF-compatible yet.
+- `Export HF Package` creates a Hugging Face-style MicroGPT folder, but it uses
+  `model_type: microgpt`, which llama.cpp does not support unless a custom
+  converter/model implementation is added.
+
+### llama.cpp
+
+Path to a local llama.cpp checkout containing:
+
+```text
+convert_hf_to_gguf.py
+```
+
+### GGUF Output
+
+Destination `.gguf` file path.
+
+### GGUF Outtype
+
+Output type passed to llama.cpp conversion.
+
+- `f16`: recommended starting point.
+- `f32`: larger, mostly useful for debugging.
+- `bf16`: useful on hardware/workflows that prefer bfloat16.
+- `q8_0`: supported by the llama.cpp converter for compatible HF models.
+- `q8_0`: converter-supported quantized output when available.
 
 ### Create Bundle
 
 Copies model artifacts into an export folder.
 
+The bundle includes required model files plus lineage and benchmark artifacts
+when available.
+
 ### Quantize Model
 
 Creates an FP16 checkpoint today.
 
+### Export HF Package
+
+Creates:
+
+```text
+model_core/hf_model/
+```
+
+The folder contains:
+
+- `config.json`
+- `pytorch_model.bin`
+- `tokenizer.json`
+- `tokenizer_config.json`
+- `special_tokens_map.json`
+- `generation_config.json`
+- `training_summary.json`
+- `model_lineage.json` when available
+- `dataset_summary.json` when available
+- `README.md`
+
+This is useful for portability and future converter work. It is not a claim
+that the model is a Llama-compatible Hugging Face model.
+
+### Convert HF to GGUF
+
+Runs llama.cpp conversion for:
+
+```text
+model_core/hf_model
+```
+
+Use this only when `hf_model` is a real Hugging Face-compatible model folder.
+The app will fail with a clear message instead of writing a fake GGUF file.
+
 ## 6. Test Chat Options
 
-The `TEST` tab is for trying a GGUF model through llama.cpp without reloading it
+The `Chat` tab is for trying a GGUF model through llama.cpp without reloading it
 for every message.
 
 Replies stream into the chat window and are rendered as Markdown. Fenced code
@@ -924,7 +1161,9 @@ match large commercial coding models. To improve behavior, you need:
 - Good tokenizer settings.
 - Reasonable model size.
 - Instruction-style examples.
+- Reasoning-shaped examples.
 - Evaluation prompts.
 
-For "thinking" behavior, train on examples that show step-by-step reasoning,
-debugging, explanation, and code review patterns.
+For "thinking" behavior, train on examples that show real problem-solving,
+debugging, explanation, and code review patterns. The app can scaffold the
+format, but the quality comes from the data.

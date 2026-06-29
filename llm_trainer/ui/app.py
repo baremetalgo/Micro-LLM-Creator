@@ -42,7 +42,8 @@ from PySide6.QtWidgets import (
 )
 
 from llm_trainer.config import DatasetConfig, ModelConfig, TrainingConfig
-from llm_trainer.export import export_project_bundle, quantize_checkpoint
+from llm_trainer.evaluation import DEFAULT_BENCHMARK_PROMPTS, evaluate_checkpoint, normalize_prompts
+from llm_trainer.export import export_gguf_with_llama_cpp, export_hf_microgpt_package, export_project_bundle, quantize_checkpoint
 from llm_trainer.llama_chat import LlamaChatSession, load_llama_chat_session, stream_chat_reply
 from llm_trainer.services import build_dataset, train_from_dataset
 from llm_trainer.ui.chat_widgets import ChatInputEdit, ChatMessageWidget
@@ -360,6 +361,14 @@ class MainWindow(QMainWindow):
         self.instruction_samples = QCheckBox("Instruction-style samples")
         self.instruction_samples.setChecked(True)
         self._tip(self.instruction_samples, "Wrap code samples with simple instruction tags so the model sees code as task-oriented examples.")
+        self.reasoning_sample_mode = QComboBox()
+        self.reasoning_sample_mode.addItems(["Reasoning scaffold", "Detailed code reasoning", "No reasoning wrapper"])
+        self.reasoning_sample_mode.setMaximumWidth(260)
+        self._tip(
+            self.reasoning_sample_mode,
+            "Shapes code samples as task/reasoning/answer examples. This teaches response structure, not guaranteed deep reasoning by itself.",
+        )
+        self.instruction_samples.toggled.connect(self.reasoning_sample_mode.setEnabled)
 
         source_form.addRow("Source vault", self._path_row(self.input_dir, directory=True))
         source_form.addRow("Dataset core", self._path_row(self.dataset_dir, directory=True))
@@ -383,6 +392,7 @@ class MainWindow(QMainWindow):
         tokenizer_form.addRow("", self.extract_code_blocks)
         tokenizer_form.addRow("", self.preserve_indentation)
         tokenizer_form.addRow("", self.instruction_samples)
+        tokenizer_form.addRow("Reasoning samples", self.reasoning_sample_mode)
         module_grid.addWidget(self._card("SOURCE ARRAY", source_form), 0, 0)
         module_grid.addWidget(self._card("TOKENIZER CORE", tokenizer_form), 0, 1)
         module_grid.setColumnStretch(0, 1)
@@ -442,6 +452,13 @@ class MainWindow(QMainWindow):
         self.preset.setMaximumWidth(260)
         self._tip(self.preset, "Architecture preset. Tiny is faster; Small has more capacity but needs more memory and training data.")
         self.preset.currentTextChanged.connect(self._apply_preset)
+        self.architecture_style = QComboBox()
+        self.architecture_style.addItems(["Classic GPT", "Llama-like"])
+        self.architecture_style.setMaximumWidth(260)
+        self._tip(
+            self.architecture_style,
+            "Classic uses learned positions, LayerNorm, and GELU. Llama-like uses RoPE, RMSNorm, and SwiGLU.",
+        )
         self.n_embd = self._spin(32, 4096, 128)
         self._tip(self.n_embd, "Embedding size, also called n_embd. Larger values increase model capacity and memory usage.")
         self.n_head = self._spin(1, 64, 4)
@@ -455,6 +472,7 @@ class MainWindow(QMainWindow):
         left.addRow("Dataset project", self._path_row(self.train_data_dir, directory=True))
         left.addRow("Model output", self._path_row(self.model_dir, directory=True))
         left.addRow("Preset", self.preset)
+        left.addRow("Block style", self.architecture_style)
         left.addRow("n_embd", self.n_embd)
         left.addRow("n_head", self.n_head)
         left.addRow("n_layer", self.n_layer)
@@ -497,6 +515,12 @@ class MainWindow(QMainWindow):
         self.resume_training = QCheckBox("Resume from latest checkpoint")
         self.resume_training.setChecked(True)
         self._tip(self.resume_training, "Continue from the latest checkpoint if training was interrupted.")
+        self.resume_safety = QCheckBox("Require compatible resume")
+        self.resume_safety.setChecked(True)
+        self._tip(
+            self.resume_safety,
+            "Before resuming, verify that the dataset tokenizer and model architecture match the checkpoint.",
+        )
         self.resume_checkpoint = QLineEdit()
         self._tip(self.resume_checkpoint, "Optional specific checkpoint file to resume from instead of the latest checkpoint.")
         right.addRow("Epochs", self.epochs)
@@ -515,6 +539,7 @@ class MainWindow(QMainWindow):
         runtime.addRow("Hardware", self.device_info)
         runtime.addRow("", self.use_amp)
         runtime.addRow("", self.resume_training)
+        runtime.addRow("", self.resume_safety)
         runtime.addRow("Resume checkpoint", self._path_row(self.resume_checkpoint, directory=False))
 
         grid.addWidget(self._card("MODEL ARCHITECTURE", left), 0, 0)
@@ -543,6 +568,34 @@ class MainWindow(QMainWindow):
         telemetry_layout = QVBoxLayout()
         telemetry_layout.addWidget(self.training_log)
         layout.addWidget(self._card("TRAINING TELEMETRY", telemetry_layout), 1)
+
+        benchmark_grid = QGridLayout()
+        benchmark_grid.setHorizontalSpacing(12)
+        benchmark_grid.setVerticalSpacing(8)
+        self.benchmark_prompts = QTextEdit()
+        self.benchmark_prompts.setMaximumHeight(110)
+        self.benchmark_prompts.setPlainText("\n\n".join(DEFAULT_BENCHMARK_PROMPTS))
+        self._tip(self.benchmark_prompts, "Benchmark prompts separated by blank lines. Run the same prompts after each training run.")
+        self.benchmark_tokens = self._spin(16, 1024, 128)
+        self._tip(self.benchmark_tokens, "Maximum generated tokens per benchmark prompt.")
+        self.benchmark_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
+        self._tip(self.benchmark_temperature, "Sampling randomness for benchmark generation.")
+        self.benchmark_kv_cache = QCheckBox("Use KV cache")
+        self.benchmark_kv_cache.setChecked(True)
+        self._tip(self.benchmark_kv_cache, "Reuse attention key/value tensors during MicroGPT benchmark generation for faster inference.")
+        self.run_benchmark_button = QPushButton("Run Benchmark")
+        self.run_benchmark_button.setMaximumWidth(180)
+        self.run_benchmark_button.clicked.connect(self.run_benchmark)
+        self._tip(self.run_benchmark_button, "Generate benchmark outputs from final_model.pt and save a benchmark JSON file.")
+        benchmark_grid.addWidget(self.benchmark_prompts, 0, 0, 3, 1)
+        benchmark_grid.addWidget(QLabel("Max tokens"), 0, 1)
+        benchmark_grid.addWidget(self.benchmark_tokens, 0, 2)
+        benchmark_grid.addWidget(QLabel("Temperature"), 1, 1)
+        benchmark_grid.addWidget(self.benchmark_temperature, 1, 2)
+        benchmark_grid.addWidget(self.benchmark_kv_cache, 2, 1, 1, 2)
+        benchmark_grid.addWidget(self.run_benchmark_button, 3, 1, 1, 2)
+        layout.addWidget(self._card("BENCHMARK PROMPTS", benchmark_grid), 0)
+
         action_row = QHBoxLayout()
         action_row.addWidget(self.train_button)
         action_row.addWidget(self.stop_training_button)
@@ -576,9 +629,20 @@ class MainWindow(QMainWindow):
         self.quant_mode.addItems(["FP16 checkpoint", "GGUF Q8_0 (planned)", "GGUF Q4_K_M (planned)", "GGUF Q5_K_M (planned)"])
         self.quant_mode.setMaximumWidth(260)
         self._tip(self.quant_mode, "Quantization target. FP16 reduces checkpoint size now; GGUF modes are planned for llama.cpp export.")
+        self.llama_cpp_dir = QLineEdit()
+        self._tip(self.llama_cpp_dir, "Local llama.cpp checkout containing convert_hf_to_gguf.py.")
+        self.gguf_output_path = QLineEdit(str(Path.cwd() / "runs" / "export" / "model.gguf"))
+        self._tip(self.gguf_output_path, "Destination GGUF file. Requires an HF-compatible hf_model folder in the model core.")
+        self.gguf_outtype = QComboBox()
+        self.gguf_outtype.addItems(["f16", "f32", "bf16", "q8_0"])
+        self.gguf_outtype.setMaximumWidth(260)
+        self._tip(self.gguf_outtype, "llama.cpp converter outtype. f16 is the usual starting point.")
         form.addRow("Model core", self._path_row(self.export_model_dir, directory=True))
         form.addRow("Output bay", self._path_row(self.export_dir, directory=True))
         form.addRow("Quantization", self.quant_mode)
+        form.addRow("llama.cpp", self._path_row(self.llama_cpp_dir, directory=True))
+        form.addRow("GGUF output", self._path_row(self.gguf_output_path, directory=False, file_filter="GGUF models (*.gguf);;All files (*)"))
+        form.addRow("GGUF outtype", self.gguf_outtype)
         layout.addWidget(self._card("ARTIFACT CONFIGURATION", form))
 
         row = QHBoxLayout()
@@ -589,10 +653,20 @@ class MainWindow(QMainWindow):
         quant_button = QPushButton("Quantize Model")
         self._tip(quant_button, "Create a smaller FP16 checkpoint for inference or later conversion workflows.")
         quant_button.clicked.connect(self.quantize_model)
+        hf_button = QPushButton("Export HF Package")
+        self._tip(hf_button, "Create model_core/hf_model with config, weights, tokenizer, lineage, and README.")
+        hf_button.clicked.connect(self.export_hf_package)
+        self.gguf_convert_button = QPushButton("Convert HF to GGUF")
+        self._tip(self.gguf_convert_button, "Run llama.cpp convert_hf_to_gguf.py for model_core/hf_model when available.")
+        self.gguf_convert_button.clicked.connect(self.convert_hf_to_gguf)
         bundle_button.setMaximumWidth(220)
         quant_button.setMaximumWidth(220)
+        hf_button.setMaximumWidth(220)
+        self.gguf_convert_button.setMaximumWidth(220)
         row.addWidget(bundle_button)
         row.addWidget(quant_button)
+        row.addWidget(hf_button)
+        row.addWidget(self.gguf_convert_button)
         row.addStretch(1)
 
         self.export_log = QTextEdit()
@@ -600,8 +674,10 @@ class MainWindow(QMainWindow):
         self.export_log.setPlainText(
             "Export options:\n"
             "- Bundle copies final_model.pt, tokenizer.json, and training_summary.json.\n"
+            "- HF package writes model_core/hf_model for portable MicroGPT loading.\n"
             "- FP16 checkpoint quantization works now.\n"
-            "- GGUF quantization options are shown as targets; the real converter path is the next milestone.\n"
+            "- GGUF conversion uses llama.cpp when model_core/hf_model exists.\n"
+            "- Native MicroGPT checkpoints are not written as fake GGUF files.\n"
         )
         export_log_layout = QVBoxLayout()
         export_log_layout.addWidget(self.export_log)
@@ -1604,6 +1680,8 @@ class MainWindow(QMainWindow):
                 "model_output": self.model_dir.text(),
                 "export_model_core": self.export_model_dir.text(),
                 "export_output": self.export_dir.text(),
+                "llama_cpp_dir": self.llama_cpp_dir.text(),
+                "gguf_output_path": self.gguf_output_path.text(),
                 "gguf_model": self.gguf_path.text(),
                 "tokenizer_import": self.tokenizer_path.text(),
                 "resume_checkpoint": self.resume_checkpoint.text(),
@@ -1624,9 +1702,11 @@ class MainWindow(QMainWindow):
                 "extract_code_blocks": self.extract_code_blocks.isChecked(),
                 "preserve_indentation": self.preserve_indentation.isChecked(),
                 "instruction_samples": self.instruction_samples.isChecked(),
+                "reasoning_sample_mode": self._reasoning_sample_mode_value(),
             },
             "training": {
                 "preset": self.preset.currentText(),
+                "architecture_style": self.architecture_style.currentText(),
                 "n_embd": self.n_embd.value(),
                 "n_head": self.n_head.value(),
                 "n_layer": self.n_layer.value(),
@@ -1645,9 +1725,15 @@ class MainWindow(QMainWindow):
                 "device": self.device.currentText(),
                 "use_amp": self.use_amp.isChecked(),
                 "resume": self.resume_training.isChecked(),
+                "require_compatible_resume": self.resume_safety.isChecked(),
+                "benchmark_prompts": self.benchmark_prompts.toPlainText(),
+                "benchmark_tokens": self.benchmark_tokens.value(),
+                "benchmark_temperature": self.benchmark_temperature.value(),
+                "benchmark_kv_cache": self.benchmark_kv_cache.isChecked(),
             },
             "export": {
                 "quantization": self.quant_mode.currentText(),
+                "gguf_outtype": self.gguf_outtype.currentText(),
             },
             "chat": {
                 "context": self.llama_context.value(),
@@ -1687,6 +1773,8 @@ class MainWindow(QMainWindow):
         self.model_dir.setText(str(paths.get("model_output", "")))
         self.export_model_dir.setText(str(paths.get("export_model_core", "")))
         self.export_dir.setText(str(paths.get("export_output", "")))
+        self.llama_cpp_dir.setText(str(paths.get("llama_cpp_dir", "")))
+        self.gguf_output_path.setText(str(paths.get("gguf_output_path", "")))
         self.gguf_path.setText(str(paths.get("gguf_model", "")))
         self.tokenizer_path.setText(str(paths.get("tokenizer_import", "")))
         self.resume_checkpoint.setText(str(paths.get("resume_checkpoint", "")))
@@ -1715,8 +1803,14 @@ class MainWindow(QMainWindow):
         self.extract_code_blocks.setChecked(bool(dataset.get("extract_code_blocks", True)))
         self.preserve_indentation.setChecked(bool(dataset.get("preserve_indentation", True)))
         self.instruction_samples.setChecked(bool(dataset.get("instruction_samples", True)))
+        self._set_combo_by_data(self.reasoning_sample_mode, str(dataset.get("reasoning_sample_mode", "scaffold")), {
+            "scaffold": "Reasoning scaffold",
+            "detailed": "Detailed code reasoning",
+            "none": "No reasoning wrapper",
+        })
 
         self._set_combo_text(self.preset, str(training.get("preset", self.preset.currentText())))
+        self._set_combo_text(self.architecture_style, str(training.get("architecture_style", self.architecture_style.currentText())))
         self.n_embd.setValue(int(training.get("n_embd", self.n_embd.value())))
         self.n_head.setValue(int(training.get("n_head", self.n_head.value())))
         self.n_layer.setValue(int(training.get("n_layer", self.n_layer.value())))
@@ -1735,8 +1829,14 @@ class MainWindow(QMainWindow):
         self._set_combo_text(self.device, str(training.get("device", self.device.currentText())))
         self.use_amp.setChecked(bool(training.get("use_amp", self.use_amp.isChecked())))
         self.resume_training.setChecked(bool(training.get("resume", self.resume_training.isChecked())))
+        self.resume_safety.setChecked(bool(training.get("require_compatible_resume", True)))
+        self.benchmark_prompts.setPlainText(str(training.get("benchmark_prompts", self.benchmark_prompts.toPlainText())))
+        self.benchmark_tokens.setValue(int(training.get("benchmark_tokens", self.benchmark_tokens.value())))
+        self.benchmark_temperature.setValue(float(training.get("benchmark_temperature", self.benchmark_temperature.value())))
+        self.benchmark_kv_cache.setChecked(bool(training.get("benchmark_kv_cache", True)))
 
         self._set_combo_text(self.quant_mode, str(export.get("quantization", self.quant_mode.currentText())))
+        self._set_combo_text(self.gguf_outtype, str(export.get("gguf_outtype", self.gguf_outtype.currentText())))
         self.llama_context.setValue(int(chat.get("context", self.llama_context.value())))
         self.llama_threads.setValue(int(chat.get("cpu_threads", self.llama_threads.value())))
         self.llama_gpu_layers.setValue(int(chat.get("gpu_layers", self.llama_gpu_layers.value())))
@@ -1774,6 +1874,9 @@ class MainWindow(QMainWindow):
                 self.dataset_status.setText(f"Dataset: {document_count:,} files, {token_count:,} tokens")
             else:
                 self.dataset_status.setText("Dataset: prepared")
+            version = summary.get("dataset_version", {})
+            if isinstance(version, dict) and version.get("version_id"):
+                self.dataset_log.append(f"Dataset version: {version['version_id']}")
             self.train_data_dir.setText(str(dataset_dir))
             self.dataset_log.append(f"Dataset already prepared: {dataset_dir}")
         else:
@@ -2114,6 +2217,7 @@ class MainWindow(QMainWindow):
             extract_code_blocks=self.extract_code_blocks.isChecked(),
             preserve_indentation=self.preserve_indentation.isChecked(),
             generate_instruction_samples=self.instruction_samples.isChecked(),
+            reasoning_sample_mode=self._reasoning_sample_mode_value(),
             prepare_mode=self._prepare_mode_value(),
             tokenizer_strategy=self._tokenizer_strategy_value(),
             tokenizer_path=Path(self.tokenizer_path.text()) if self.tokenizer_path.text().strip() else None,
@@ -2153,6 +2257,8 @@ class MainWindow(QMainWindow):
         self.dataset_log.append(
             f"Cache summary: reused {result.cached_file_count:,} file(s), processed {result.processed_file_count:,} file(s)."
         )
+        if getattr(result, "dataset_version_id", ""):
+            self.dataset_log.append(f"Dataset version: {result.dataset_version_id}")
         if result.warning:
             self.dataset_log.append(f"Recommendation: {result.warning}")
         self.train_data_dir.setText(str(result.output_dir))
@@ -2194,6 +2300,41 @@ class MainWindow(QMainWindow):
             return "import_tokenizer"
         return "auto"
 
+    def _reasoning_sample_mode_value(self) -> str:
+        """Return the selected reasoning sample mode.
+
+        Returns:
+            Internal reasoning sample mode.
+        """
+
+        label = self.reasoning_sample_mode.currentText()
+        if label == "Detailed code reasoning":
+            return "detailed"
+        if label == "No reasoning wrapper":
+            return "none"
+        return "scaffold"
+
+    def _architecture_style_config(self) -> dict[str, Any]:
+        """Return ModelConfig keyword arguments for the selected block style.
+
+        Returns:
+            Architecture style settings.
+        """
+
+        if self.architecture_style.currentText() == "Llama-like":
+            return {
+                "norm_type": "rmsnorm",
+                "position_encoding": "rope",
+                "mlp_type": "swiglu",
+                "rope_theta": 10000.0,
+            }
+        return {
+            "norm_type": "layernorm",
+            "position_encoding": "learned",
+            "mlp_type": "gelu",
+            "rope_theta": 10000.0,
+        }
+
     def _tokenizer_strategy_reuses(self) -> bool:
         """Return whether current tokenizer strategy ignores vocabulary controls.
 
@@ -2225,6 +2366,7 @@ class MainWindow(QMainWindow):
             head_count=self.n_head.value(),
             layer_count=self.n_layer.value(),
             dropout=self.dropout.value(),
+            **self._architecture_style_config(),
         )
         resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
         training_config = TrainingConfig(
@@ -2243,6 +2385,7 @@ class MainWindow(QMainWindow):
             seed=self.seed.value(),
             resume=self.resume_training.isChecked(),
             resume_from_checkpoint=resume_path if self.resume_training.isChecked() else None,
+            require_compatible_resume=self.resume_safety.isChecked(),
         )
         self.training_log.clear()
         self.training_progress.setValue(0)
@@ -2283,6 +2426,51 @@ class MainWindow(QMainWindow):
             self.project_state.setText("Training complete")
             self.train_status.setText(f"Training: loss {result.final_train_loss:.4f}")
         self._clear_button_busy("Start Training")
+
+    def run_benchmark(self) -> None:
+        """Run benchmark prompts against the current trained model."""
+
+        prompts = normalize_prompts(self.benchmark_prompts.toPlainText())
+        self.training_log.append(f"Running benchmark with {len(prompts)} prompt(s)...")
+        self.training_progress.setValue(0)
+        self.project_state.setText("Benchmarking")
+        self._run_task(
+            evaluate_checkpoint,
+            (
+                Path(self.model_dir.text()),
+                prompts,
+                None,
+                self.benchmark_tokens.value(),
+                self.benchmark_temperature.value(),
+                50,
+                self.device.currentText(),
+                self.benchmark_kv_cache.isChecked(),
+            ),
+            self._benchmark_finished,
+            self.training_log,
+            self.training_progress,
+            with_progress=True,
+            button=self.run_benchmark_button,
+            stop_button=self.stop_training_button,
+            busy_text="Benchmarking",
+        )
+
+    @Slot(object)
+    def _benchmark_finished(self, result: Any) -> None:
+        """Update UI after benchmark prompts finish.
+
+        Args:
+            result: Benchmark result object.
+        """
+
+        self.training_progress.setRange(0, 100)
+        self.training_progress.setValue(100)
+        self.training_log.append(
+            f"Benchmark complete: {result.prompt_count} prompt(s), {result.total_seconds:.2f}s."
+        )
+        self.training_log.append(f"Benchmark saved: {result.output_path}")
+        self.project_state.setText("Benchmark complete")
+        self._clear_button_busy("Run Benchmark")
 
     def toggle_llm_model(self) -> None:
         """Load or unload the GGUF model depending on current state."""
@@ -2481,6 +2669,56 @@ class MainWindow(QMainWindow):
         self.export_progress.setValue(100)
         self.export_log.append(f"Quantized checkpoint created: {result}")
         self.export_status.setText("Export: FP16 checkpoint ready")
+
+    def export_hf_package(self) -> None:
+        """Create an HF-style MicroGPT package."""
+
+        self.export_log.append("Creating HF-style MicroGPT package...")
+        self.export_progress.setValue(20)
+        try:
+            result = export_hf_microgpt_package(Path(self.export_model_dir.text()))
+        except Exception as exc:
+            self.export_log.append(f"Error: {exc}")
+            self.export_progress.setValue(0)
+            return
+        self.export_progress.setValue(100)
+        self.export_log.append(f"HF package created: {result}")
+        self.export_log.append("Note: this package is MicroGPT model_type, not a llama.cpp-supported Llama model.")
+        self.export_status.setText("Export: HF package ready")
+
+    def convert_hf_to_gguf(self) -> None:
+        """Convert an HF-compatible model folder to GGUF through llama.cpp."""
+
+        self.export_log.append("Starting llama.cpp GGUF conversion...")
+        self.export_progress.setValue(0)
+        self._run_task(
+            export_gguf_with_llama_cpp,
+            (
+                Path(self.export_model_dir.text()),
+                Path(self.llama_cpp_dir.text()),
+                Path(self.gguf_output_path.text()),
+                self.gguf_outtype.currentText(),
+            ),
+            self._gguf_conversion_finished,
+            self.export_log,
+            self.export_progress,
+            button=self.gguf_convert_button,
+            busy_text="Converting GGUF",
+        )
+
+    @Slot(object)
+    def _gguf_conversion_finished(self, result: Any) -> None:
+        """Update UI after GGUF conversion finishes.
+
+        Args:
+            result: GGUF output path.
+        """
+
+        self.export_progress.setValue(100)
+        self.export_log.append(f"GGUF created: {result}")
+        self.gguf_path.setText(str(result))
+        self.export_status.setText("Export: GGUF ready")
+        self._clear_button_busy("Convert HF to GGUF")
 
     def _apply_preset(self, preset: str) -> None:
         """Apply architecture values for a preset.

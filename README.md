@@ -4,8 +4,7 @@
 <p align="center"><img src="03.png" width="50%" /><img src="04.png" width="50%" /></p>
 <p align="center"><img src="01.png" width="50" /><img src="02.png" width="50%" /></p>
 
-Desktop app for preparing text/code datasets and training small
-GPT-style language models.
+Desktop app for preparing text/code datasets and training small model.
 
 Requires Python 3.9 or newer.
 
@@ -54,7 +53,7 @@ checkpoint by default. The UI exposes model options such as `n_embd`, `n_head`,
 `n_layer`, context length, learning rate, batch size, warmup, checkpoint
 interval, AMP, resume, and FP16 checkpoint quantization.
 
-The TEST tab can load a `.gguf` model through `llama-cpp-python` and keep it in
+The Chat tab can load a `.gguf` model through `llama-cpp-python` and keep it in
 memory for a ChatGPT-style local test chat with streamed, Markdown-rendered
 replies. GPU offload is requested by default with `n_gpu_layers=-1`; install a
 GPU-enabled llama-cpp-python build for actual CUDA/Metal acceleration.
@@ -87,6 +86,16 @@ $env:FORCE_CMAKE="1"
 pip install --no-cache-dir --force-reinstall llama-cpp-python
 ```
 
-The GGUF path is intentionally not hand-written yet. The next export milestone is
-to save a Hugging Face-compatible model folder and convert it through llama.cpp's
-official converter tooling.
+The app does not write fake GGUF files from native MicroGPT checkpoints. The
+Export tab can run llama.cpp's `convert_hf_to_gguf.py` when the model folder
+contains a real Hugging Face-compatible `hf_model` directory.
+
+For MicroGPT checkpoints, use the HF-style package export first:
+
+```bash
+python -m llm_trainer.cli export-hf --model_dir runs/model
+```
+
+That creates `runs/model/hf_model` with config, weights, tokenizer metadata,
+lineage, and a README. It is portable MicroGPT packaging, not a claim that the
+checkpoint is already a llama.cpp-supported Llama/Mistral/Gemma model.

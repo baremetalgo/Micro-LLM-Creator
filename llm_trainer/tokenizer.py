@@ -117,6 +117,39 @@ def token_id(tokenizer: Tokenizer, token: str) -> int:
     return value
 
 
+def missing_training_special_tokens(tokenizer: Tokenizer) -> list[str]:
+    """Return special tokens missing from a tokenizer.
+
+    Args:
+        tokenizer: Tokenizer to inspect.
+
+    Returns:
+        Missing special token strings.
+    """
+
+    return [token for token in SPECIAL_TOKENS if tokenizer.token_to_id(token) is None]
+
+
+def validate_training_tokenizer(tokenizer: Tokenizer) -> None:
+    """Validate that a tokenizer can be used by the MicroGPT trainer.
+
+    Args:
+        tokenizer: Tokenizer to validate.
+
+    Raises:
+        ValueError: If required special tokens are missing.
+    """
+
+    missing = missing_training_special_tokens(tokenizer)
+    if missing:
+        raise ValueError(
+            "Tokenizer is not compatible with Micro LLM Creator training. "
+            f"Missing required special token(s): {', '.join(missing)}. "
+            "Use a tokenizer created by this app, or import a tokenizer containing "
+            "<pad>, <unk>, <bos>, and <eos>."
+        )
+
+
 def encode_text(tokenizer: Tokenizer, text: str) -> list[int]:
     """Encode text into token IDs.
 
