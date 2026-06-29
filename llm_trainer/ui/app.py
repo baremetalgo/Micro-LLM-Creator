@@ -484,12 +484,15 @@ class MainWindow(QMainWindow):
         self.seed = self._spin(1, 2_147_483_647, 1337)
         self._tip(self.seed, "Random seed for reproducible initialization and sampling order.")
         self.device = QComboBox()
-        self.device.addItem("cuda" if torch.cuda.is_available() else "cpu")
-        self.device.addItem("cpu")
         self.device.setMaximumWidth(260)
         self._tip(self.device, "Hardware target. CUDA uses NVIDIA GPU when available; CPU is slower but broadly compatible.")
+        self.device_info = QLabel()
+        self.device_info.setObjectName("Metric")
+        self.device_info.setWordWrap(True)
+        self.device_info.setMaximumWidth(360)
+        self._configure_device_options()
         self.use_amp = QCheckBox("Use mixed precision on CUDA")
-        self.use_amp.setChecked(torch.cuda.is_available())
+        self.use_amp.setChecked(self.use_amp_default)
         self._tip(self.use_amp, "Use mixed precision on CUDA. Usually faster and lighter on GPU memory.")
         self.resume_training = QCheckBox("Resume from latest checkpoint")
         self.resume_training.setChecked(True)
@@ -509,6 +512,7 @@ class MainWindow(QMainWindow):
         runtime = QFormLayout()
         self._configure_form(runtime)
         runtime.addRow("Device", self.device)
+        runtime.addRow("Hardware", self.device_info)
         runtime.addRow("", self.use_amp)
         runtime.addRow("", self.resume_training)
         runtime.addRow("Resume checkpoint", self._path_row(self.resume_checkpoint, directory=False))
@@ -871,6 +875,27 @@ class MainWindow(QMainWindow):
         form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(9)
+
+    def _configure_device_options(self) -> None:
+        """Populate training device choices without duplicate CPU entries."""
+
+        self.device.clear()
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            self.device.addItem("cuda")
+            self.device.addItem("cpu")
+            self.device_info.setText(f"CUDA ready: {device_name}")
+            self.use_amp_default = True
+        else:
+            self.device.addItem("cpu")
+            cuda_build = getattr(torch.backends, "cuda", None)
+            built_with_cuda = bool(cuda_build and torch.backends.cuda.is_built())
+            if built_with_cuda:
+                detail = "CUDA build found, but no usable NVIDIA GPU/driver was detected."
+            else:
+                detail = "CUDA is not available in this PyTorch install."
+            self.device_info.setText(detail)
+            self.use_amp_default = False
 
     def _thin_progress(self) -> QProgressBar:
         """Create a thin bottom progress bar.
