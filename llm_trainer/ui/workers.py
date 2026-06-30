@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from queue import Queue
 from threading import Event
 from typing import Any, Optional
 
 from PySide6.QtCore import QObject, Signal
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TaskWorker(QObject):
@@ -47,6 +51,7 @@ class TaskWorker(QObject):
             else:
                 self.finished.emit(self.fn(*self.args))
         except Exception as exc:
+            LOGGER.exception("Background worker failed while running %s", getattr(self.fn, "__name__", self.fn))
             self.failed.emit(str(exc))
 
     def _queue_progress(self, event: Any) -> None:

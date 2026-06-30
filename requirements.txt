@@ -11,3 +11,4 @@ markdown
 Pygments
 pyqtgraph
 psutil
+datasets

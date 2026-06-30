@@ -44,22 +44,53 @@ The app has five main work areas:
 
 ## 2. Recommended Workflow
 
-1. Collect clean training material.
-2. Open `IN`.
-3. Choose the source folder.
-4. Click `Check Health` to verify project paths, artifacts, and hardware.
-5. Click `Preview Dataset` to inspect source files and sample extracted text/code.
-6. Enable Code Training Mode if your data contains programming material.
-7. Prepare the dataset.
-8. Open `AI`.
-9. Choose a model size and training settings.
-10. Start training.
-11. Resume training if interrupted.
-12. Open `X`.
-13. Bundle or quantize the trained model.
-14. Open `Chat`.
-15. Load a GGUF model and test prompts in the chat window.
-16. Use `Save Project` to store paths and settings for the next session.
+1. Collect clean base training material.
+2. Prepare a `Base pretraining` dataset from local files and optional base corpora.
+3. Open `AI`, choose `Pretrain from scratch`, and train the base checkpoint.
+4. Prepare an `Instruction fine-tune` dataset if you want request-following behavior.
+5. Choose `Instruction fine-tune`, select the base checkpoint, and fine-tune.
+6. Prepare a `Conversation fine-tune` dataset if you want assistant/chat behavior.
+7. Choose `Conversation fine-tune`, select the latest compatible checkpoint, and fine-tune.
+8. Resume training if interrupted.
+9. Open `X` to bundle, quantize, or convert the trained model.
+10. Open `Chat`, load a GGUF model, and test prompts.
+11. Use `Save Project` to store paths and settings for the next session.
+
+### Training Stages
+
+Micro LLM Creator separates model creation into stages.
+
+`Base pretraining`
+
+- Starts from random weights.
+- Learns tokenizer usage, grammar, language patterns, code syntax, and broad
+  next-token prediction.
+- Use local PDFs, text, code files, and optional base corpora.
+- Online base corpora are opt-in. Nothing is selected by default.
+
+Optional online base datasets:
+
+- `TinyStories`: simple short stories for basic fluency.
+- `WikiText-103`: clean Wikipedia-style long-form text.
+- `Wikipedia EN 2023`: broad encyclopedia prose. Use a row limit.
+- `FineWeb-Edu sample`: large educational web text. Use a row limit.
+
+`Instruction fine-tune`
+
+- Loads a compatible base checkpoint.
+- Starts a fresh optimizer run.
+- Teaches the model to follow tasks and produce answer-shaped responses.
+- Use datasets such as Alpaca, Dolly, or SlimOrca.
+
+`Conversation fine-tune`
+
+- Loads a compatible base or instruction-tuned checkpoint.
+- Teaches multi-turn chat style, short replies, helpfulness, and conversational
+  flow.
+- Use datasets such as UltraChat, DailyDialog, or OpenAssistant.
+
+TinyStories is not selected by default and is not shown in fine-tuning stages.
+It is a base-pretraining option only.
 
 ## 2.1 New, Save, and Open Projects
 
@@ -286,6 +317,53 @@ Effect on the LLM:
 - More high-quality data improves coverage and fluency.
 - Badly extracted PDFs can teach broken formatting.
 - Real source-code files are much better than code copied from PDFs.
+
+### Dataset Purpose
+
+Selects the role of the prepared dataset.
+
+- `Base pretraining`: base language/model training from local files and optional
+  base corpora.
+- `Instruction fine-tune`: task-following data for a checkpoint that already
+  knows language basics.
+- `Conversation fine-tune`: multi-turn chat data for assistant behavior.
+
+Effect on the LLM:
+
+- Base pretraining teaches broad prediction ability.
+- Instruction fine-tuning teaches prompt/answer behavior.
+- Conversation fine-tuning teaches chat style and turn-taking.
+
+The selected purpose also filters the online dataset list. TinyStories appears
+only in `Base pretraining`; instruction and chat datasets appear only in their
+fine-tuning stages.
+
+### Include Online Training Datasets
+
+Downloads or reads selected Hugging Face datasets into the project dataset
+cache. This is opt-in. No online dataset is selected by default.
+
+Base pretraining options:
+
+- `TinyStories`: basic language fluency.
+- `WikiText-103`: clean long-form text.
+- `Wikipedia EN 2023`: broad encyclopedia prose.
+- `FineWeb-Edu sample`: educational web text.
+
+Instruction fine-tune options:
+
+- `Alpaca 52K`: compact instruction-following examples.
+- `Dolly 15K`: human-written instruction examples.
+- `SlimOrca`: instruction and reasoning-style assistant answers.
+
+Conversation fine-tune options:
+
+- `UltraChat 200K`: multi-turn assistant conversations.
+- `DailyDialog`: everyday dialogue.
+- `OpenAssistant OASST1`: assistant-style conversation messages.
+
+Use `Rows per dataset` to limit large downloads. Start with a small limit for a
+smoke test before preparing a large dataset.
 
 ### Dataset Core
 
@@ -658,6 +736,104 @@ Includes:
 dataset ID, dataset version, tokenizer size, resume checkpoint, compatibility
 safety setting, and checkpoint path.
 
+### Resume Safety
+
+`Resume latest` continues from the newest checkpoint in the model output
+folder. You can also choose a specific checkpoint path.
+
+Click `Check Resume` to preview compatibility before starting training. The
+report appears in the `Resume Compatibility` panel and shows blocking errors,
+warnings, and safe-resume details.
+
+`Safe resume` checks the checkpoint before training starts. It blocks resume
+when the tokenizer or model shape changed, including vocabulary size, context
+length, `n_embd`, `n_head`, `n_layer`, block style, RoPE settings, attention
+type, or effective KV head count. These changes make checkpoint weights
+incompatible.
+
+When `Safe resume` is enabled, optimizer, scheduler, and AMP scaler state must
+also match so the run continues exactly. If you intentionally want to continue
+from model weights with a different optimizer or schedule, disable `Safe
+resume`. The app will then skip incompatible optimizer/scheduler/scaler state
+and continue as a weight-only fine-tuning run.
+
+Changes such as dropout, sliding attention window, attention backend, learning
+rate, weight decay, and gradient clipping are shown as warnings because they
+change training behavior without necessarily changing checkpoint tensor shapes.
+
+### Training Mode
+
+`Pretrain from scratch` starts from random model weights. Use this for the first
+model in a model family.
+
+`Instruction fine-tune` loads compatible model weights from a base checkpoint,
+then starts a fresh optimizer and scheduler run on an instruction dataset. Use
+this after base pretraining when you want the model to follow requests.
+
+`Conversation fine-tune` loads compatible model weights from a base or
+instruction-tuned checkpoint, then trains on multi-turn dialogue/chat data. Use
+this after the model has learned basic language patterns.
+
+`Fine-tune checkpoint` is the generic fine-tune mode for custom/domain data
+that is not specifically instruction or conversation data.
+
+Click `Check Fine-tune` before training. The compatibility report appears in the
+same `Resume Compatibility` panel.
+
+Important:
+
+- Fine-tuning requires the same tokenizer vocabulary and compatible model shape.
+- Fine-tuning does not load optimizer, scheduler, or AMP scaler state.
+- Resuming an existing run takes priority if `Resume latest` finds a checkpoint
+  in the current model output folder.
+- For fine-tuning, prepare the new dataset with `Reuse dataset tokenizer` or
+  `Import tokenizer.json` from the base model family so token IDs remain stable.
+
+### PEFT / LoRA
+
+`Full fine-tune` updates all trainable model weights.
+
+`LoRA adapters` freezes the base model and trains small low-rank adapter
+matrices on selected projection layers. This is parameter-efficient fine-tuning:
+intermediate checkpoints store only adapter weights, optimizer state, scheduler
+state, and metadata instead of rewriting the whole model every time.
+
+LoRA outputs:
+
+- `checkpoints/checkpoint_<step>.pt`: adapter-only resumable checkpoint.
+- `checkpoints/checkpoint_stopped_step_<step>.pt`: adapter-only stopped
+  checkpoint.
+- `final_adapter.pt`: final adapter-only checkpoint.
+- `final_model.pt`: merged full checkpoint for existing benchmark/export tools.
+
+LoRA options:
+
+- `LoRA rank`: adapter capacity. Higher is stronger but larger.
+- `LoRA alpha`: adapter scaling. A common starting point is `2 * rank`.
+- `LoRA dropout`: adapter-only dropout.
+- `LoRA target`: attach adapters to attention projections, MLP projections, or
+  both.
+
+Recommendation:
+
+- Use `LoRA adapters` for most task adaptation and code fine-tuning.
+- Use `Full fine-tune` when you intentionally want every model weight updated.
+- Keep a stable base checkpoint and tokenizer for a model family.
+
+### Training Profile
+
+Profiles quickly apply practical optimizer, schedule, precision, and
+regularization choices.
+
+- `Stable LLM`: AdamW, cosine schedule, normal defaults.
+- `Low-memory`: Adafactor, grouped-query attention, lower memory profile.
+- `Code fine-tune`: lower learning rate and lower gradient clip for adapting a
+  base checkpoint to code data.
+- `Experimental Lion`: Lion optimizer with one-cycle schedule for experiments.
+
+Profiles are a starting point. You can still edit every option after applying a
+profile.
+
 ### Preset
 
 Quick architecture presets.
@@ -719,6 +895,31 @@ Examples:
 - `128 / 4`
 - `256 / 4`
 - `512 / 8`
+
+### Attention
+
+Attention controls how query heads share key/value heads.
+
+- `Multi-head`: classic full multi-head attention.
+- `Grouped-query`: shares key/value heads across groups of query heads. This can
+  reduce memory and improve generation efficiency.
+- `Multi-query`: all query heads share one key/value head. This is very
+  memory-efficient but changes model behavior.
+
+`KV heads` controls grouped-query key/value head count. It must divide `n_head`.
+It is ignored by normal multi-head attention and forced to one for multi-query
+attention.
+
+`Backend` controls the attention kernel:
+
+- `SDPA / Flash when available`: lets PyTorch use its scaled-dot-product
+  attention path. On supported CUDA systems, PyTorch may use Flash Attention
+  internally.
+- `Manual`: uses the app's explicit attention implementation. It is useful for
+  debugging but can be slower.
+
+`Window` enables sliding-window attention. `0` means full context. A positive
+number restricts attention to recent tokens.
 
 ### n_layer
 
@@ -822,6 +1023,28 @@ Recommendation:
 - `0.1` default.
 - `0.01` for smaller datasets if learning seems weak.
 
+### Optimizer
+
+Controls how model weights are updated.
+
+- `AdamW`: safest default for small LLM training.
+- `Adam`: classic Adam without decoupled weight decay behavior.
+- `Lion`: experimental sign-based optimizer. Can work well, but tune carefully.
+- `Adafactor`: memory-conscious optimizer when supported by your PyTorch build.
+
+### Schedule
+
+Controls learning-rate changes over time.
+
+- `Warmup linear`: warm up, then linearly decay.
+- `Cosine decay`: warm up, then smoothly decay. Good general default.
+- `Polynomial decay`: warm up, then polynomial decay controlled by `Poly power`.
+- `One-cycle`: rises and falls over the run. Useful for experiments.
+- `Constant`: warm up, then keep LR steady.
+
+`Min LR` controls the lowest schedule multiplier. `Poly power` controls the
+shape of polynomial decay.
+
 ### Gradient Accumulation
 
 Accumulates gradients across multiple batches before updating.
@@ -920,6 +1143,14 @@ Recommendation:
 
 - Keep enabled on CUDA.
 
+### Precision
+
+Numeric precision for mixed precision training.
+
+- `FP16`: fast and memory-efficient on many NVIDIA GPUs.
+- `BF16`: more numerically stable on GPUs that support BF16.
+- `FP32`: safest but uses more memory and is usually slower.
+
 ### Resume from Latest Checkpoint
 
 Continues interrupted training.
@@ -970,6 +1201,7 @@ Effect:
 - Runs the same prompts against `final_model.pt`.
 - Saves outputs to `benchmarks/benchmark_<timestamp>.json` inside the model
   folder.
+- Records generated token count and generated token speed.
 - Helps compare model versions beyond train/validation loss.
 
 Recommendation:

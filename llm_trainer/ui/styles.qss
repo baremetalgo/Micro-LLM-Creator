@@ -185,6 +185,27 @@ QTextEdit {
     font-size: 12px;
 }
 
+QTableWidget {
+    background: #111111;
+    alternate-background-color: #1b1b1b;
+    color: #eeeeee;
+    border: 1px solid #555555;
+    border-radius: 7px;
+    gridline-color: #333333;
+    selection-background-color: #3a2d19;
+    selection-color: #ffffff;
+}
+
+QHeaderView::section {
+    background: #202020;
+    color: #f5b041;
+    border: 0;
+    border-right: 1px solid #3d3d3d;
+    border-bottom: 1px solid #3d3d3d;
+    padding: 6px 8px;
+    font-weight: 800;
+}
+
 QTextBrowser {
     background: #111111;
     color: #eeeeee;

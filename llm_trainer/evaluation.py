@@ -28,11 +28,15 @@ class BenchmarkResult:
         output_path: JSON file containing benchmark outputs.
         prompt_count: Number of prompts evaluated.
         total_seconds: Total elapsed time.
+        total_generated_tokens: Total generated tokens across prompts.
+        tokens_per_second: Average generated-token throughput.
     """
 
     output_path: Path
     prompt_count: int
     total_seconds: float
+    total_generated_tokens: int = 0
+    tokens_per_second: float = 0.0
 
 
 def normalize_prompts(raw_prompts: str) -> list[str]:
@@ -116,9 +120,11 @@ def evaluate_checkpoint(
             use_kv_cache=use_kv_cache,
         )
         output_ids = generated[0].tolist()
+        generated_token_count = max(len(output_ids) - len(input_ids), 0)
         if eos_id in output_ids[len(input_ids) :]:
             eos_index = output_ids.index(eos_id, len(input_ids))
             output_ids = output_ids[:eos_index]
+            generated_token_count = max(len(output_ids) - len(input_ids), 0)
         text = tokenizer.decode(output_ids)
         elapsed = perf_counter() - prompt_started
         outputs.append(
@@ -127,11 +133,15 @@ def evaluate_checkpoint(
                 "prompt": prompt,
                 "output": text,
                 "elapsed_seconds": elapsed,
+                "generated_tokens": generated_token_count,
+                "tokens_per_second": generated_token_count / max(elapsed, 1e-9),
                 "characters": len(text),
             }
         )
 
     total = perf_counter() - started
+    total_generated_tokens = sum(int(item.get("generated_tokens", 0)) for item in outputs)
+    tokens_per_second = total_generated_tokens / max(total, 1e-9)
     payload = {
         "schema": "micro_llm_benchmark",
         "version": 1,
@@ -147,10 +157,12 @@ def evaluate_checkpoint(
         "model_lineage": lineage,
         "prompt_count": len(prompts),
         "total_seconds": total,
+        "total_generated_tokens": total_generated_tokens,
+        "tokens_per_second": tokens_per_second,
         "results": outputs,
     }
     output_path = output_dir / f"benchmark_{utc_timestamp()}.json"
     write_json(output_path, payload)
     if progress:
         progress({"message": f"Benchmark saved: {output_path}", "percent": 100})
-    return BenchmarkResult(output_path, len(prompts), total)
+    return BenchmarkResult(output_path, len(prompts), total, total_generated_tokens, tokens_per_second)

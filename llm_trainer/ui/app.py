@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 from datetime import datetime
 import json
+import logging
 import os
 from queue import Empty, Queue
 import re
@@ -11,14 +12,15 @@ import signal
 import sqlite3
 import sys
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any, Optional, Union
 
 import torch
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Slot
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Slot, qInstallMessageHandler
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractButton,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -40,12 +42,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from llm_trainer.app_logging import qt_message_handler, setup_logging
 from llm_trainer.config import DatasetConfig, ModelConfig, TrainingConfig
+from llm_trainer.conversation_datasets import CONVERSATION_DATASET_PRESETS, dataset_ids_for_stage, dataset_stage_label
+from llm_trainer.contracts import BackendKind
+from llm_trainer.contracts.jobs import RuntimeSpec, TrainingJobSpec
+from llm_trainer.coordinator import CoordinatorApiServer, JobManager, create_job_artifact_bundle
 from llm_trainer.evaluation import DEFAULT_BENCHMARK_PROMPTS, evaluate_checkpoint, normalize_prompts
 from llm_trainer.export import export_gguf_with_llama_cpp, export_hf_microgpt_package, export_project_bundle, quantize_checkpoint
+from llm_trainer.fine_tuning_service import run_fine_tuning_job
 from llm_trainer.llama_chat import LlamaChatSession, load_llama_chat_session, stream_chat_reply
 from llm_trainer.services import build_dataset, check_project_health, scan_dataset_preview
 from llm_trainer.telemetry_store import initialize_store, insert_metric, latest_run, rows_until, telemetry_db_path
+from llm_trainer.training import check_resume_compatibility, latest_checkpoint
 from llm_trainer.training_planning import estimate_training_resources, format_bytes
 from llm_trainer.training_service import run_training_job
 from llm_trainer.ui.chat_widgets import ChatMessageWidget
@@ -57,6 +66,8 @@ from llm_trainer.ui.tabs.dataset_tab import build_dataset_tab
 from llm_trainer.ui.tabs.live_tab import build_live_training_tab
 from llm_trainer.ui.tabs.training_tab import build_training_tab
 from llm_trainer.ui.tabs.export_tab import build_export_tab
+from llm_trainer.ui.tabs.fine_tuning_tab import build_fine_tuning_tab
+from llm_trainer.ui.tabs.job_manager_tab import build_job_manager_tab, set_table_rows
 
 try:
     import psutil
@@ -65,6 +76,7 @@ except ImportError:
 
 
 WINDOWS_APP_ID = "MicroLLMCreator.Lightning"
+LOGGER = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -74,6 +86,8 @@ class MainWindow(QMainWindow):
         """Create the main application window."""
 
         super().__init__()
+        self.log_file_path = setup_logging()
+        LOGGER.info("Creating Micro LLM Creator main window")
         if QApplication.instance():
             QApplication.instance().setFont(QFont("Arial", 10))
         self.setWindowTitle("Micro LLM Creator")
@@ -100,6 +114,9 @@ class MainWindow(QMainWindow):
         self.training_cards: list[QWidget] = []
         self.training_controls_grid: Optional[QGridLayout] = None
         self.training_controls_columns = 3
+        self.active_training_log: Optional[QTextEdit] = None
+        self.active_training_progress: Optional[QProgressBar] = None
+        self.active_training_final_button_text = "Start Training"
         self.interrupt_count = 0
         self.chat_session: Optional[LlamaChatSession] = None
         self.chat_markdown = ""
@@ -114,11 +131,83 @@ class MainWindow(QMainWindow):
         self.spinner_timer.timeout.connect(self._tick_spinner)
         self.progress_timer = QTimer(self)
         self.progress_timer.timeout.connect(self._drain_progress_queue)
+        self.job_manager = JobManager()
+        self.coordinator_server: Optional[CoordinatorApiServer] = None
+        self.coordinator_thread: Optional[Thread] = None
+        self.job_manager_timer = QTimer(self)
+        self.job_manager_timer.setInterval(2500)
+        self.job_manager_timer.timeout.connect(self.refresh_job_manager_tab)
 
         self._apply_style()
 
         shell = self._build_shell()
         self.setCentralWidget(shell)
+        self._install_ui_event_logging(shell)
+        self.job_manager_timer.start()
+
+    def _install_ui_event_logging(self, root: QWidget) -> None:
+        """Log user-facing widget actions and parameter changes.
+
+        Args:
+            root: Root widget to scan for child controls.
+        """
+
+        for widget in root.findChildren(QWidget):
+            if isinstance(widget, QAbstractButton):
+                if widget.isCheckable():
+                    widget.toggled.connect(
+                        lambda checked, item=widget: self._log_ui_event("toggled", item, checked)
+                    )
+                else:
+                    widget.clicked.connect(
+                        lambda checked=False, item=widget: self._log_ui_event("clicked", item, checked)
+                    )
+            elif isinstance(widget, QComboBox):
+                widget.currentTextChanged.connect(
+                    lambda value, item=widget: self._log_ui_event("changed", item, value)
+                )
+            elif isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(
+                    lambda value, item=widget: self._log_ui_event("changed", item, value)
+                )
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.valueChanged.connect(
+                    lambda value, item=widget: self._log_ui_event("changed", item, value)
+                )
+            elif isinstance(widget, QLineEdit):
+                widget.editingFinished.connect(
+                    lambda item=widget: self._log_ui_event("edited", item, item.text())
+                )
+
+    def _log_ui_event(self, action: str, widget: QWidget, value: Any) -> None:
+        """Log a UI action or parameter value.
+
+        Args:
+            action: Event label.
+            widget: Widget that emitted the event.
+            value: Current value.
+        """
+
+        LOGGER.info("UI %s: %s = %s", action, self._widget_log_name(widget), value)
+
+    @staticmethod
+    def _widget_log_name(widget: QWidget) -> str:
+        """Return a useful log label for a widget.
+
+        Args:
+            widget: Widget to describe.
+
+        Returns:
+            Human-readable widget label.
+        """
+
+        if isinstance(widget, QAbstractButton) and widget.text():
+            return widget.text().replace("\n", " ")
+        if isinstance(widget, QLineEdit) and widget.placeholderText():
+            return widget.placeholderText()
+        if widget.objectName():
+            return widget.objectName()
+        return widget.__class__.__name__
 
     def _apply_style(self) -> None:
         """Load the application stylesheet from the QSS module file."""
@@ -202,26 +291,35 @@ class MainWindow(QMainWindow):
         rail_layout.setSpacing(12)
         self.dataset_nav = self._nav_button("⇩\nIN")
         self.training_nav = self._nav_button("✦\nAI")
+        self.training_nav.setText("AI")
+        self.fine_tune_nav = self._nav_button("FT")
         self.live_nav = self._nav_button("LIVE")
+        self.jobs_nav = self._nav_button("JOB")
         self.benchmark_nav = self._nav_button("◷\nBench")
         self.export_nav = self._nav_button("⇧\nX")
         self.chat_nav = self._nav_button("◌\nChat")
         self._tip(self.dataset_nav, "Open dataset preparation: load text/PDF files and build tokenizer data.")
         self._tip(self.training_nav, "Open model training: configure architecture and optimization settings.")
+        self._tip(self.fine_tune_nav, "Open fine-tuning: adapt checkpoints with instruction, conversation, or LoRA settings.")
         self._tip(self.live_nav, "Open the live training tracker with model flow, charts, metrics, and telemetry.")
+        self._tip(self.jobs_nav, "Open Job Manager: monitor workers, remote connections, assignments, and job controls.")
         self._tip(self.benchmark_nav, "Open benchmark prompts: test checkpoint quality with repeatable prompts.")
         self._tip(self.export_nav, "Open export tools: bundle or quantize the trained model artifacts.")
         self._tip(self.chat_nav, "Open Chat: load a GGUF model once and send prompts.")
         self.dataset_nav.setChecked(True)
         self.dataset_nav.clicked.connect(lambda: self._switch_page(0))
         self.training_nav.clicked.connect(lambda: self._switch_page(1))
-        self.live_nav.clicked.connect(lambda: self._switch_page(2))
-        self.benchmark_nav.clicked.connect(lambda: self._switch_page(3))
-        self.export_nav.clicked.connect(lambda: self._switch_page(4))
-        self.chat_nav.clicked.connect(lambda: self._switch_page(5))
+        self.fine_tune_nav.clicked.connect(lambda: self._switch_page(2))
+        self.live_nav.clicked.connect(lambda: self._switch_page(3))
+        self.jobs_nav.clicked.connect(lambda: self._switch_page(4))
+        self.benchmark_nav.clicked.connect(lambda: self._switch_page(5))
+        self.export_nav.clicked.connect(lambda: self._switch_page(6))
+        self.chat_nav.clicked.connect(lambda: self._switch_page(7))
         rail_layout.addWidget(self.dataset_nav)
         rail_layout.addWidget(self.training_nav)
+        rail_layout.addWidget(self.fine_tune_nav)
         rail_layout.addWidget(self.live_nav)
+        rail_layout.addWidget(self.jobs_nav)
         rail_layout.addWidget(self.benchmark_nav)
         rail_layout.addWidget(self.export_nav)
         rail_layout.addWidget(self.chat_nav)
@@ -230,7 +328,9 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_dataset_tab())
         self.pages.addWidget(self._build_training_tab())
+        self.pages.addWidget(self._build_fine_tuning_tab())
         self.pages.addWidget(self._build_live_training_tab())
+        self.pages.addWidget(self._build_job_manager_tab())
         self.pages.addWidget(self._build_benchmark_tab())
         self.pages.addWidget(self._build_export_tab())
         self.pages.addWidget(self._build_chat_tab())
@@ -263,10 +363,21 @@ class MainWindow(QMainWindow):
         """
 
         self.pages.setCurrentIndex(index)
-        buttons = [self.dataset_nav, self.training_nav, self.live_nav, self.benchmark_nav, self.export_nav, self.chat_nav]
+        buttons = [
+            self.dataset_nav,
+            self.training_nav,
+            self.fine_tune_nav,
+            self.live_nav,
+            self.jobs_nav,
+            self.benchmark_nav,
+            self.export_nav,
+            self.chat_nav,
+        ]
         for button_index, button in enumerate(buttons):
             button.setChecked(button_index == index)
         self._refresh_training_layout()
+        if index == 4:
+            self.refresh_job_manager_tab()
 
     def resizeEvent(self, event: Any) -> None:
         """Refresh responsive layouts when the main window changes size.
@@ -329,6 +440,15 @@ class MainWindow(QMainWindow):
 
         return build_training_tab(self)
 
+    def _build_fine_tuning_tab(self) -> QWidget:
+        """Build the fine-tuning page.
+
+        Returns:
+            Fine-tuning page widget.
+        """
+
+        return build_fine_tuning_tab(self)
+
     def _build_live_training_tab(self) -> QWidget:
         """Build the live training tracker page.
 
@@ -337,6 +457,273 @@ class MainWindow(QMainWindow):
         """
 
         return build_live_training_tab(self)
+
+    def _build_job_manager_tab(self) -> QWidget:
+        """Build the distributed job manager page.
+
+        Returns:
+            Job manager page widget.
+        """
+
+        return build_job_manager_tab(self)
+
+    def refresh_job_manager_tab(self) -> None:
+        """Refresh the job manager dashboard tables."""
+
+        if not hasattr(self, "job_worker_table"):
+            return
+        workers = self.job_manager.list_workers()
+        jobs = self.job_manager.list_jobs()
+        heartbeats = self.job_manager.state_store.latest_heartbeats()
+        worker_rows = []
+        for worker in workers:
+            heartbeat = heartbeats.get(worker.worker_id, {})
+            metrics = heartbeat.get("metrics") or {}
+            active_job = heartbeat.get("active_job_id") or self._active_job_for_worker(worker.worker_id)
+            capabilities = worker.capabilities or {}
+            cpu_ram_gpu = (
+                f"CPU {capabilities.get('cpu_count', '-')}, "
+                f"RAM {capabilities.get('system_ram_gb', '-')} GB, "
+                f"VRAM {capabilities.get('total_vram_gb', '-')} GB"
+            )
+            if metrics:
+                cpu_ram_gpu = f"{cpu_ram_gpu}, util {metrics.get('gpu_util', metrics.get('gpu_memory_percent', '-'))}"
+            worker_rows.append(
+                [
+                    worker.worker_id,
+                    worker.status.value,
+                    worker.backend.value,
+                    worker.device,
+                    worker.last_heartbeat_at or "-",
+                    active_job or "-",
+                    cpu_ram_gpu,
+                    ", ".join(capabilities.get("labels") or []) or "-",
+                ]
+            )
+        set_table_rows(self.job_worker_table, worker_rows)
+
+        job_rows = []
+        for managed in jobs:
+            job = managed.spec
+            metrics = managed.latest_metrics
+            job_rows.append(
+                [
+                    job.job_id,
+                    job.status.value,
+                    managed.assigned_worker_id or "-",
+                    job.runtime.backend.value,
+                    self._metric_pair(metrics.epoch if metrics else None, metrics.total_epochs if metrics else None),
+                    self._metric_pair(metrics.step if metrics else None, metrics.total_steps if metrics else None),
+                    str(job.training.batch_size),
+                    str(job.model.config.layer_count),
+                    self._metric_float(metrics.train_loss if metrics else None),
+                    self._metric_float(metrics.tokens_per_second if metrics else None, suffix=" tok/s"),
+                    managed.updated_at,
+                ]
+            )
+        set_table_rows(self.job_table, job_rows)
+        active_count = sum(1 for item in jobs if item.spec.status.value in {"assigned", "running", "paused", "stopping"})
+        queued_count = sum(1 for item in jobs if item.spec.status.value == "queued")
+        self.job_worker_count_label.setText(f"Workers: {len(workers)}")
+        self.job_active_count_label.setText(f"Active jobs: {active_count}")
+        self.job_queue_count_label.setText(f"Queued jobs: {queued_count}")
+        self.job_db_label.setText(f"State DB: {self.job_manager.state_store.db_path}")
+        self.job_manager_progress.setValue(100)
+
+    def pause_all_managed_jobs(self) -> None:
+        """Pause all managed jobs."""
+
+        count = self.job_manager.pause_all_jobs()
+        self.job_manager_log.append(f"Pause requested for {count} job(s).")
+        self.refresh_job_manager_tab()
+
+    def resume_all_managed_jobs(self) -> None:
+        """Resume all paused managed jobs."""
+
+        count = self.job_manager.resume_all_jobs()
+        self.job_manager_log.append(f"Resumed {count} job(s).")
+        self.refresh_job_manager_tab()
+
+    def stop_all_managed_jobs(self) -> None:
+        """Stop all managed jobs."""
+
+        count = self.job_manager.stop_all_jobs()
+        self.job_manager_log.append(f"Stop requested for {count} job(s).")
+        self.refresh_job_manager_tab()
+
+    def mark_stale_workers_offline(self) -> None:
+        """Mark stale remote workers offline."""
+
+        workers = self.job_manager.mark_stale_workers_offline()
+        if workers:
+            self.job_manager_log.append(f"Marked offline: {', '.join(workers)}")
+        else:
+            self.job_manager_log.append("No stale remote workers found.")
+        self.refresh_job_manager_tab()
+
+    def start_coordinator_server(self) -> None:
+        """Start the coordinator API used by remote workers."""
+
+        if self.coordinator_server is not None:
+            self.job_manager_log.append("Coordinator API is already running.")
+            return
+        host = self.coordinator_host.text().strip() or "0.0.0.0"
+        port = self.coordinator_port.value()
+        artifact_root = Path(self.coordinator_artifact_root.text().strip()).expanduser()
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.coordinator_server = CoordinatorApiServer(
+                manager=self.job_manager,
+                host=host,
+                port=port,
+                artifact_root=artifact_root,
+            )
+            self.coordinator_thread = Thread(target=self.coordinator_server.serve_forever, daemon=True)
+            self.coordinator_thread.start()
+        except Exception as exc:
+            self.coordinator_server = None
+            self.coordinator_thread = None
+            QMessageBox.warning(self, "Coordinator failed", f"Could not start coordinator API:\n{exc}")
+            return
+        public_url = self.coordinator_public_url.text().strip() or f"http://127.0.0.1:{port}"
+        self.coordinator_public_url.setText(public_url.rstrip("/"))
+        self.coordinator_status_label.setText(f"Coordinator: running at {public_url.rstrip('/')}")
+        self.coordinator_start_button.setEnabled(False)
+        self.coordinator_stop_button.setEnabled(True)
+        self.project_state.setText("Coordinator running")
+        self.job_manager_log.append(f"Coordinator API started on {host}:{port}.")
+        self.job_manager_log.append(f"Artifact sync root: {artifact_root}")
+
+    def stop_coordinator_server(self) -> None:
+        """Stop the coordinator API."""
+
+        if self.coordinator_server is None:
+            return
+        self.coordinator_server.shutdown()
+        if self.coordinator_thread is not None:
+            self.coordinator_thread.join(timeout=3)
+        self.coordinator_server = None
+        self.coordinator_thread = None
+        self.coordinator_status_label.setText("Coordinator: stopped")
+        self.coordinator_start_button.setEnabled(True)
+        self.coordinator_stop_button.setEnabled(False)
+        self.project_state.setText("Coordinator stopped")
+        self.job_manager_log.append("Coordinator API stopped.")
+
+    def publish_remote_training_job(self) -> None:
+        """Bundle the current training setup and queue it for remote workers."""
+
+        if self.coordinator_server is None:
+            self.start_coordinator_server()
+            if self.coordinator_server is None:
+                return
+        try:
+            job = self._current_remote_training_job()
+            artifact_root = Path(self.coordinator_artifact_root.text().strip()).expanduser()
+            base_url = f"{self.coordinator_public_url.text().strip().rstrip('/')}/artifacts"
+            bundle_path = create_job_artifact_bundle(job, artifact_root=artifact_root, base_url=base_url)
+            self.job_manager.submit(job)
+        except Exception as exc:
+            QMessageBox.warning(self, "Publish failed", f"Could not publish remote job:\n{exc}")
+            return
+        self.job_manager_log.append(f"Published remote job: {job.job_id}")
+        self.job_manager_log.append(f"Input bundle: {bundle_path}")
+        self.job_manager_log.append(f"Worker download URL: {job.metadata.get('artifact_bundle_url')}")
+        self.project_state.setText("Remote job queued")
+        self.refresh_job_manager_tab()
+
+    def _current_remote_training_job(self) -> TrainingJobSpec:
+        """Build a remote-worker job from current training controls.
+
+        Returns:
+            Complete training job spec ready to bundle and queue.
+
+        Raises:
+            FileNotFoundError: If the prepared dataset is missing.
+            ValueError: If model or training options are invalid.
+        """
+
+        dataset_dir = Path(self.train_data_dir.text().strip())
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"Prepared dataset folder does not exist: {dataset_dir}")
+        for file_name in ("tokenizer.json", "train_tokens.json", "val_tokens.json"):
+            if not (dataset_dir / file_name).exists():
+                raise FileNotFoundError(f"Prepared dataset is missing {file_name}. Prepare the dataset first.")
+        vocab_size = self._current_training_vocab_size(dataset_dir)
+        if vocab_size <= 0:
+            raise ValueError("Could not determine tokenizer vocabulary size from the prepared dataset.")
+        resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
+        if resume_path is None and self.resume_training.isChecked():
+            resume_path = latest_checkpoint(Path(self.model_dir.text()) / "checkpoints")
+        model_config = self._current_model_config(vocab_size=vocab_size)
+        training_config = self._current_training_config(resume_path, training_mode="pretrain")
+        model_config.validate()
+        training_config.validate()
+        job = TrainingJobSpec.local(
+            dataset_dir,
+            model_config,
+            training_config,
+            metadata={
+                "project_name": self.search_box.text().strip(),
+                "submitted_from": "desktop_ui",
+                "coordinator_url": self.coordinator_public_url.text().strip().rstrip("/"),
+            },
+        )
+        job.runtime = RuntimeSpec(
+            backend=BackendKind.REMOTE_CLIENT,
+            device=training_config.device,
+            tags=[training_config.device, "remote"],
+        )
+        return job
+
+    def _active_job_for_worker(self, worker_id: str) -> str:
+        """Return the active job ID for a worker.
+
+        Args:
+            worker_id: Worker identifier.
+
+        Returns:
+            Active job ID or empty string.
+        """
+
+        for managed in self.job_manager.list_jobs():
+            if managed.assigned_worker_id == worker_id and managed.spec.status.value in {"assigned", "running", "paused", "stopping"}:
+                return managed.spec.job_id
+        return ""
+
+    @staticmethod
+    def _metric_pair(value: Optional[int], total: Optional[int]) -> str:
+        """Format a metric pair.
+
+        Args:
+            value: Current value.
+            total: Total value.
+
+        Returns:
+            Display text.
+        """
+
+        if value is None:
+            return "-"
+        if total is None:
+            return str(value)
+        return f"{value}/{total}"
+
+    @staticmethod
+    def _metric_float(value: Optional[float], suffix: str = "") -> str:
+        """Format a floating-point metric.
+
+        Args:
+            value: Metric value.
+            suffix: Optional suffix.
+
+        Returns:
+            Display text.
+        """
+
+        if value is None:
+            return "-"
+        return f"{value:.4g}{suffix}"
 
     def _init_telemetry_store(self, model_dir: Path) -> None:
         """Create or reset the SQLite telemetry store for a training run.
@@ -641,6 +1028,7 @@ class MainWindow(QMainWindow):
         vocab_size = int(summary.get("tokenizer_vocab_size", summary.get("vocab_size", 0)) or 0)
         code_count = int(summary.get("code_sample_count", 0) or 0)
         prose_count = int(summary.get("prose_sample_count", 0) or 0)
+        conversation_count = int(summary.get("conversation_sample_count", 0) or 0)
         cached_count = int(summary.get("cached_file_count", 0) or 0)
         processed_count = int(summary.get("processed_file_count", 0) or 0)
         skipped_count = int(summary.get("skipped_file_count", 0) or 0)
@@ -649,7 +1037,7 @@ class MainWindow(QMainWindow):
         self.dataset_quality_samples.setText(f"Samples: {document_count:,}")
         self.dataset_quality_tokens.setText(f"Tokens: {token_count:,}")
         self.dataset_quality_vocab.setText(f"Vocab: {vocab_size:,}" if vocab_size else "Vocab: -")
-        self.dataset_quality_code.setText(f"Code/prose: {code_count:,}/{prose_count:,}")
+        self.dataset_quality_code.setText(f"Code/prose/chat: {code_count:,}/{prose_count:,}/{conversation_count:,}")
         self.dataset_quality_balance.setText("Balance: prepared")
         self.dataset_quality_readiness.setText("Readiness: preview needed")
         self.dataset_quality_cache.setText(f"Files: {processed_count:,} ok, {cached_count:,} cached, {skipped_count:,} skipped, {failed_count:,} failed")
@@ -1056,6 +1444,7 @@ class MainWindow(QMainWindow):
         self.current_project_file = project_file
         self._apply_project_runtime_environment(project_dir)
         self.project_state.setText("Project saved")
+        LOGGER.info("Project saved: %s", project_file)
         if self.current_project_file == project_file:
             self.dataset_log.append(f"Project saved: {project_file}")
             self.dataset_log.append(f"Project workspace: {project_dir}")
@@ -1080,11 +1469,25 @@ class MainWindow(QMainWindow):
         if self.chat_session is not None and hasattr(self.chat_session, "reset"):
             self.chat_session.reset()
         self.chat_session = None
-        self.current_project_file = None
+        base_dir = QFileDialog.getExistingDirectory(self, "Choose folder where the new project will be created", str(Path.cwd()))
+        if not base_dir:
+            return
+        project_name = self.search_box.text().strip() or "MicroLLMProject"
+        project_dir = Path(base_dir) / self._safe_project_name(project_name)
+        project_file = project_dir / "project.json"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_project_workspace(project_dir)
+        self.current_project_file = project_file
         self._apply_project_state(self._default_project_state())
+        self.search_box.setText(project_name)
+        self._apply_project_workspace_paths(project_dir)
+        self._apply_project_runtime_environment(project_dir)
         self._reset_project_runtime_state()
+        project_file.write_text(json.dumps(self._project_state_dict(project_name, project_dir), indent=2), encoding="utf-8")
         self.project_state.setText("New project")
-        self.dataset_log.append("Started a new project.")
+        LOGGER.info("New project created: %s", project_file)
+        self.dataset_log.append(f"Started a new project: {project_file}")
+        self.dataset_log.append(f"Project workspace: {project_dir}")
 
     def open_project(self) -> None:
         """Open a saved project file and restore UI settings."""
@@ -1109,6 +1512,7 @@ class MainWindow(QMainWindow):
         if self.model_dir.text().strip():
             self._load_existing_telemetry(Path(self.model_dir.text()))
         self.project_state.setText("Project opened")
+        LOGGER.info("Project opened: %s", project_file)
         self.dataset_log.append(f"Opened project: {project_file}")
         self.refresh_model_estimate()
 
@@ -1119,7 +1523,7 @@ class MainWindow(QMainWindow):
             project_dir: Project root folder.
         """
 
-        for name in ("datasets", "models", "exports", "cache", "temp"):
+        for name in ("datasets", "models", "exports", "training_data", "cache", "temp"):
             (project_dir / name).mkdir(parents=True, exist_ok=True)
 
     def _apply_project_workspace_paths(self, project_dir: Path) -> None:
@@ -1132,12 +1536,15 @@ class MainWindow(QMainWindow):
         dataset_dir = project_dir / "datasets"
         model_dir = project_dir / "models"
         export_dir = project_dir / "exports"
+        training_data_dir = project_dir / "training_data"
         self.dataset_dir.setText(str(dataset_dir))
         self.train_data_dir.setText(str(dataset_dir))
         self.model_dir.setText(str(model_dir))
         self.export_model_dir.setText(str(model_dir))
         self.export_dir.setText(str(export_dir))
         self.gguf_output_path.setText(str(export_dir / "model.gguf"))
+        if not self.input_dir.text().strip():
+            self.input_dir.setText(str(training_data_dir))
 
     def _apply_project_runtime_environment(self, project_dir: Path) -> None:
         """Prefer project-local cache/temp folders for runtime work.
@@ -1184,10 +1591,15 @@ class MainWindow(QMainWindow):
                 "gguf_model": "",
                 "tokenizer_import": "",
                 "resume_checkpoint": "",
+                "fine_tune_checkpoint": "",
             },
             "dataset": {
                 "auto_vocab": True,
                 "manual_vocab_size": 8000,
+                "include_conversation_datasets": False,
+                "dataset_stage": "base",
+                "conversation_datasets": [],
+                "conversation_sample_limit": 20000,
                 "min_frequency": 2,
                 "context_length": 128,
                 "validation_split": 0.1,
@@ -1206,11 +1618,20 @@ class MainWindow(QMainWindow):
             "training": {
                 "preset": "Tiny",
                 "architecture_style": "Classic GPT",
+                "launch_target": "local",
+                "training_mode": "pretrain",
+                "training_stage": "base",
+                "peft_method": "none",
+                "lora_rank": 8,
+                "lora_alpha": 16.0,
+                "lora_dropout": 0.05,
+                "lora_target_modules": "attention",
                 "n_embd": 128,
                 "n_head": 4,
                 "n_layer": 4,
                 "context_length": 128,
                 "dropout": 0.1,
+                "training_profile": "Stable LLM",
                 "epochs": 5,
                 "batch_size": 16,
                 "learning_rate": 0.0003,
@@ -1248,6 +1669,12 @@ class MainWindow(QMainWindow):
                 "repeat_penalty": 1.1,
                 "system_prompt": "",
             },
+            "distributed": {
+                "host": "0.0.0.0",
+                "port": 8765,
+                "artifact_root": str(Path.home() / ".micro_llm_creator" / "artifacts"),
+                "public_url": "http://127.0.0.1:8765",
+            },
             "artifacts": {},
         }
 
@@ -1256,6 +1683,7 @@ class MainWindow(QMainWindow):
 
         self.dataset_log.clear()
         self.training_log.clear()
+        self.fine_tune_log.clear()
         self.benchmark_log.clear()
         self.export_log.setPlainText(
             "Export options:\n"
@@ -1265,7 +1693,14 @@ class MainWindow(QMainWindow):
             "- GGUF conversion uses llama.cpp when model_core/hf_model exists.\n"
             "- Native MicroGPT checkpoints are not written as fake GGUF files.\n"
         )
-        for progress in (self.dataset_progress, self.training_progress, self.benchmark_progress, self.export_progress, self.chat_progress):
+        for progress in (
+            self.dataset_progress,
+            self.training_progress,
+            self.fine_tune_progress,
+            self.benchmark_progress,
+            self.export_progress,
+            self.chat_progress,
+        ):
             progress.setRange(0, 100)
             progress.setValue(0)
         self.dataset_status.setText("Dataset: not prepared")
@@ -1274,8 +1709,10 @@ class MainWindow(QMainWindow):
         self.chat_status.setText("Chat: no GGUF loaded")
         self.prepare_button.setText("Prepare Dataset")
         self.train_button.setText("Start Training")
+        self.fine_tune_button.setText("Start Fine-Tune")
         self.stop_dataset_button.setEnabled(False)
         self.stop_training_button.setEnabled(False)
+        self.stop_fine_tune_button.setEnabled(False)
         self.stop_benchmark_button.setEnabled(False)
         self.stop_chat_button.setEnabled(False)
         self.load_llm_button.setText("Load Model")
@@ -1355,10 +1792,15 @@ class MainWindow(QMainWindow):
                 "gguf_model": self.gguf_path.text(),
                 "tokenizer_import": self.tokenizer_path.text(),
                 "resume_checkpoint": self.resume_checkpoint.text(),
+                "fine_tune_checkpoint": self.fine_tune_checkpoint.text(),
             },
             "dataset": {
                 "auto_vocab": self.auto_vocab.isChecked(),
                 "manual_vocab_size": self.manual_vocab_size.value(),
+                "include_conversation_datasets": self.include_conversation_datasets.isChecked(),
+                "dataset_stage": self._dataset_stage_value(),
+                "conversation_datasets": self._selected_conversation_datasets(),
+                "conversation_sample_limit": self.conversation_sample_limit.value(),
                 "min_frequency": self.min_frequency.value(),
                 "context_length": self.context_length.value(),
                 "validation_split": self.validation_split.value(),
@@ -1377,15 +1819,24 @@ class MainWindow(QMainWindow):
             "training": {
                 "preset": self.preset.currentText(),
                 "architecture_style": self.architecture_style.currentText(),
+                "launch_target": self._training_launch_target_value(),
+                "training_stage": self._training_stage_value(),
                 "n_embd": self.n_embd.value(),
                 "n_head": self.n_head.value(),
                 "attention_type": self._attention_type_value(),
                 "kv_head_count": self.kv_head_count.value(),
                 "attention_backend": self._attention_backend_value(),
                 "attention_window": self.attention_window.value(),
+                "training_mode": self._training_mode_value(),
+                "peft_method": self._peft_method_value(),
+                "lora_rank": self.lora_rank.value(),
+                "lora_alpha": self.lora_alpha.value(),
+                "lora_dropout": self.lora_dropout.value(),
+                "lora_target_modules": self._lora_target_value(),
                 "n_layer": self.n_layer.value(),
                 "context_length": self.train_context_length.value(),
                 "dropout": self.dropout.value(),
+                "training_profile": self.training_profile.currentText(),
                 "epochs": self.epochs.value(),
                 "batch_size": self.batch_size.value(),
                 "learning_rate": self.learning_rate.value(),
@@ -1428,6 +1879,12 @@ class MainWindow(QMainWindow):
                 "repeat_penalty": self.chat_repeat_penalty.value(),
                 "system_prompt": self.system_prompt.toPlainText(),
             },
+            "distributed": {
+                "host": self.coordinator_host.text(),
+                "port": self.coordinator_port.value(),
+                "artifact_root": self.coordinator_artifact_root.text(),
+                "public_url": self.coordinator_public_url.text(),
+            },
             "artifacts": {
                 "dataset_summary": self._read_json_if_exists(dataset_dir / "dataset_summary.json") if dataset_dir else None,
                 "training_summary": self._read_json_if_exists(model_dir / "training_summary.json") if model_dir else None,
@@ -1448,6 +1905,7 @@ class MainWindow(QMainWindow):
         training = data.get("training", {})
         export = data.get("export", {})
         chat = data.get("chat", {})
+        distributed = data.get("distributed", {})
 
         self.input_dir.setText(str(paths.get("source_vault", "")))
         self.dataset_dir.setText(str(paths.get("dataset_core", "")))
@@ -1460,9 +1918,15 @@ class MainWindow(QMainWindow):
         self.gguf_path.setText(str(paths.get("gguf_model", "")))
         self.tokenizer_path.setText(str(paths.get("tokenizer_import", "")))
         self.resume_checkpoint.setText(str(paths.get("resume_checkpoint", "")))
+        self.fine_tune_checkpoint.setText(str(paths.get("fine_tune_checkpoint", "")))
 
         self.auto_vocab.setChecked(bool(dataset.get("auto_vocab", True)))
         self.manual_vocab_size.setValue(int(dataset.get("manual_vocab_size", self.manual_vocab_size.value())))
+        include_conversation = bool(dataset.get("include_conversation_datasets", False))
+        self._set_dataset_stage(str(dataset.get("dataset_stage", "base")))
+        self.include_conversation_datasets.setChecked(include_conversation)
+        self._set_selected_conversation_datasets(list(dataset.get("conversation_datasets", [])))
+        self.conversation_sample_limit.setValue(int(dataset.get("conversation_sample_limit", self.conversation_sample_limit.value())))
         self.min_frequency.setValue(int(dataset.get("min_frequency", self.min_frequency.value())))
         self.context_length.setValue(int(dataset.get("context_length", self.context_length.value())))
         self.validation_split.setValue(float(dataset.get("validation_split", self.validation_split.value())))
@@ -1493,6 +1957,10 @@ class MainWindow(QMainWindow):
 
         self._set_combo_text(self.preset, str(training.get("preset", self.preset.currentText())))
         self._set_combo_text(self.architecture_style, str(training.get("architecture_style", self.architecture_style.currentText())))
+        self._set_combo_by_data(self.training_launch_target, str(training.get("launch_target", "local")), {
+            "local": "Local machine",
+            "remote": "Remote workers",
+        })
         self.n_embd.setValue(int(training.get("n_embd", self.n_embd.value())))
         self.n_head.setValue(int(training.get("n_head", self.n_head.value())))
         self._set_combo_by_data(self.attention_type, str(training.get("attention_type", "mha")), {
@@ -1506,9 +1974,33 @@ class MainWindow(QMainWindow):
             "manual": "Manual",
         })
         self.attention_window.setValue(int(training.get("attention_window", self.attention_window.value())))
+        self._set_combo_by_data(self.training_mode, str(training.get("training_mode", "pretrain")), {
+            "pretrain": "Pretrain from scratch",
+            "fine_tune": "Fine-tune checkpoint",
+            "instruction_fine_tune": "Instruction fine-tune",
+            "conversation_fine_tune": "Conversation fine-tune",
+        })
+        training_stage = str(training.get("training_stage", ""))
+        if training_stage == "instruction":
+            self._set_combo_text(self.training_mode, "Instruction fine-tune")
+        elif training_stage == "conversation":
+            self._set_combo_text(self.training_mode, "Conversation fine-tune")
+        self._set_combo_by_data(self.peft_method, str(training.get("peft_method", "none")), {
+            "none": "Full fine-tune",
+            "lora": "LoRA adapters",
+        })
+        self.lora_rank.setValue(int(training.get("lora_rank", self.lora_rank.value())))
+        self.lora_alpha.setValue(float(training.get("lora_alpha", self.lora_alpha.value())))
+        self.lora_dropout.setValue(float(training.get("lora_dropout", self.lora_dropout.value())))
+        self._set_combo_by_data(self.lora_targets, str(training.get("lora_target_modules", "attention")), {
+            "attention": "Attention projections",
+            "mlp": "MLP projections",
+            "attention,mlp": "Attention + MLP",
+        })
         self.n_layer.setValue(int(training.get("n_layer", self.n_layer.value())))
         self.train_context_length.setValue(int(training.get("context_length", self.train_context_length.value())))
         self.dropout.setValue(float(training.get("dropout", self.dropout.value())))
+        self._set_combo_text(self.training_profile, str(training.get("training_profile", self.training_profile.currentText())))
         self.epochs.setValue(int(training.get("epochs", self.epochs.value())))
         self.batch_size.setValue(int(training.get("batch_size", self.batch_size.value())))
         self.learning_rate.setValue(float(training.get("learning_rate", self.learning_rate.value())))
@@ -1563,7 +2055,13 @@ class MainWindow(QMainWindow):
         self.chat_top_p.setValue(float(chat.get("top_p", self.chat_top_p.value())))
         self.chat_repeat_penalty.setValue(float(chat.get("repeat_penalty", self.chat_repeat_penalty.value())))
         self.system_prompt.setPlainText(str(chat.get("system_prompt", "")))
+        if hasattr(self, "coordinator_host"):
+            self.coordinator_host.setText(str(distributed.get("host", self.coordinator_host.text())))
+            self.coordinator_port.setValue(int(distributed.get("port", self.coordinator_port.value())))
+            self.coordinator_artifact_root.setText(str(distributed.get("artifact_root", self.coordinator_artifact_root.text())))
+            self.coordinator_public_url.setText(str(distributed.get("public_url", self.coordinator_public_url.text())))
         self._update_tokenizer_strategy_controls()
+        self._update_training_mode_controls()
         self._restore_artifact_status(data.get("artifacts", {}))
 
     def _restore_artifact_status(self, artifacts: dict[str, Any]) -> None:
@@ -1580,14 +2078,17 @@ class MainWindow(QMainWindow):
             token_count = int(summary.get("token_count", 0) or 0)
             code_count = int(summary.get("code_sample_count", 0) or 0)
             prose_count = int(summary.get("prose_sample_count", 0) or 0)
+            conversation_count = int(summary.get("conversation_sample_count", 0) or 0)
             vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
             self._update_dataset_quality_report(summary)
             self.prepare_button.setText("DataSet Prepared")
             self.dataset_progress.setValue(100)
             if vocab_size:
                 self.auto_vocab_label.setText(f"{vocab_size:,}")
-            if code_count or prose_count:
-                self.dataset_status.setText(f"Dataset: {code_count:,} code, {prose_count:,} prose, {token_count:,} tokens")
+            if code_count or prose_count or conversation_count:
+                self.dataset_status.setText(
+                    f"Dataset: {code_count:,} code, {prose_count:,} prose, {conversation_count:,} chat, {token_count:,} tokens"
+                )
             elif document_count or token_count:
                 self.dataset_status.setText(f"Dataset: {document_count:,} files, {token_count:,} tokens")
             else:
@@ -1714,6 +2215,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Task running", "Please wait for the current task to finish.")
             return
 
+        LOGGER.info("Starting background task: %s", getattr(fn, "__name__", str(fn)))
         if button:
             self._set_button_busy(button, busy_text)
         if stop_button:
@@ -1755,6 +2257,7 @@ class MainWindow(QMainWindow):
 
         if self.active_log is None or self.active_progress_bar is None:
             return
+        LOGGER.error("Background task failed: %s", message)
         self._task_failed(message, self.active_log, self.active_progress_bar)
 
     def stop_active_task(self) -> None:
@@ -1762,6 +2265,7 @@ class MainWindow(QMainWindow):
 
         if self.stop_event is None:
             return
+        LOGGER.info("Stop requested for active background task")
         self.stop_event.set()
         if self.active_log is not None:
             self.active_log.append("Stop requested. Finishing the current safe point...")
@@ -1784,6 +2288,17 @@ class MainWindow(QMainWindow):
             QApplication.quit()
             return
         QTimer.singleShot(3000, lambda: os._exit(130) if self.thread is not None else QApplication.quit())
+
+    def closeEvent(self, event: Any) -> None:
+        """Clean up background services before the window closes.
+
+        Args:
+            event: Qt close event.
+        """
+
+        if self.coordinator_server is not None:
+            self.stop_coordinator_server()
+        super().closeEvent(event)
 
     def _handle_progress(self, event: object, log: QTextEdit, progress_bar: QProgressBar) -> None:
         """Apply one progress event to UI widgets.
@@ -2053,6 +2568,7 @@ class MainWindow(QMainWindow):
     def _thread_finished(self) -> None:
         """Clean up thread bookkeeping after a worker finishes."""
 
+        LOGGER.info("Background task thread finished")
         self._drain_progress_queue()
         if self.progress_timer.isActive():
             self.progress_timer.stop()
@@ -2078,6 +2594,10 @@ class MainWindow(QMainWindow):
         """
 
         stopped_by_user = "stopped by user" in message.lower()
+        if stopped_by_user:
+            LOGGER.info("Background task stopped by user: %s", message)
+        else:
+            LOGGER.error("Background task error: %s", message)
         log.append(f"Stopped: {message}" if stopped_by_user else f"Error: {message}")
         progress_bar.setRange(0, 100)
         progress_bar.setValue(0)
@@ -2139,6 +2659,8 @@ class MainWindow(QMainWindow):
             input_dir=Path(self.input_dir.text()),
             output_dir=Path(self.dataset_dir.text()),
             vocab_size=None if self.auto_vocab.isChecked() else self.manual_vocab_size.value(),
+            conversation_datasets=self._selected_conversation_datasets(),
+            conversation_sample_limit=self.conversation_sample_limit.value(),
             min_frequency=self.min_frequency.value(),
             context_length=self.context_length.value(),
             validation_split=self.validation_split.value(),
@@ -2154,6 +2676,7 @@ class MainWindow(QMainWindow):
             prepare_mode=self._prepare_mode_value(),
             tokenizer_strategy=self._tokenizer_strategy_value(),
             tokenizer_path=Path(self.tokenizer_path.text()) if self.tokenizer_path.text().strip() else None,
+            dataset_stage=self._dataset_stage_value(),
         )
 
     def check_project_health(self) -> None:
@@ -2317,6 +2840,41 @@ class MainWindow(QMainWindow):
         self.dataset_progress.setValue(0)
         self._reset_dataset_quality_report()
         self.dataset_log.append("Preparing dataset...")
+        self.dataset_log.append(f"App log file: {self.log_file_path}")
+        self.dataset_log.append(f"Dataset purpose: {dataset_stage_label(config.dataset_stage)}")
+        if self.include_conversation_datasets.isChecked():
+            selected_labels = [
+                checkbox.text()
+                for checkbox in getattr(self, "conversation_dataset_checks", {}).values()
+                if checkbox.isChecked() and checkbox.isVisible()
+            ]
+            if selected_labels:
+                hf_cache = config.output_dir / "cache" / "huggingface"
+                self.dataset_log.append(f"Online training datasets: {', '.join(selected_labels)}")
+                self.dataset_log.append(f"Downloading/loading online data at: {hf_cache}")
+                LOGGER.info("Online training datasets: %s", ", ".join(selected_labels))
+                LOGGER.info("Downloading/loading online data at: %s", hf_cache)
+            else:
+                self.dataset_log.append("Online training datasets are enabled, but no dataset is selected for this purpose.")
+                LOGGER.warning("Online training datasets enabled, but no dataset is selected")
+        else:
+            self.dataset_log.append("Online training datasets: off. Local source files only.")
+            LOGGER.info("Online training datasets: off. Local source files only.")
+            checked_count = sum(
+                1
+                for checkbox in getattr(self, "conversation_dataset_checks", {}).values()
+                if checkbox.isChecked()
+            )
+            if checked_count:
+                self.dataset_log.append("Checked online dataset choices are ignored until the master checkbox is enabled.")
+                LOGGER.info("Checked online dataset choices are ignored until the master checkbox is enabled")
+        LOGGER.info(
+            "Preparing dataset: input=%s output=%s stage=%s online_datasets=%s",
+            config.input_dir,
+            config.output_dir,
+            config.dataset_stage,
+            ",".join(config.conversation_datasets) or "off",
+        )
         self.project_state.setText("Preparing dataset")
         self.dataset_status.setText("Dataset: preparing")
         self.auto_vocab_label.setText("Calculating...")
@@ -2342,6 +2900,16 @@ class MainWindow(QMainWindow):
 
         self.dataset_progress.setValue(100)
         self.auto_vocab_label.setText(f"{result.vocab_size:,}")
+        LOGGER.info(
+            "Dataset prepared: documents=%s tokens=%s vocab=%s code=%s prose=%s conversation=%s output=%s",
+            result.document_count,
+            result.token_count,
+            result.vocab_size,
+            result.code_sample_count,
+            result.prose_sample_count,
+            getattr(result, "conversation_sample_count", 0),
+            result.output_dir,
+        )
         self.dataset_log.append(
             f"Prepared {result.document_count} documents, {result.character_count:,} characters, "
             f"{result.token_count:,} tokens, vocab {result.vocab_size:,}."
@@ -2361,6 +2929,7 @@ class MainWindow(QMainWindow):
                 "tokenizer_vocab_size": result.vocab_size,
                 "code_sample_count": result.code_sample_count,
                 "prose_sample_count": result.prose_sample_count,
+                "conversation_sample_count": getattr(result, "conversation_sample_count", 0),
                 "cached_file_count": result.cached_file_count,
                 "processed_file_count": result.processed_file_count,
                 "skipped_file_count": result.skipped_file_count,
@@ -2421,6 +2990,99 @@ class MainWindow(QMainWindow):
         if label == "No reasoning wrapper":
             return "none"
         return "scaffold"
+
+    def _dataset_stage_value(self) -> str:
+        """Return the selected dataset preparation stage.
+
+        Returns:
+            Dataset stage identifier.
+        """
+
+        return {
+            "Base pretraining": "base",
+            "Instruction fine-tune": "instruction",
+            "Conversation fine-tune": "conversation",
+        }.get(self.dataset_stage.currentText(), "base")
+
+    def _set_dataset_stage(self, stage: str) -> None:
+        """Set the dataset stage combo from an internal stage value.
+
+        Args:
+            stage: Dataset stage identifier.
+        """
+
+        self._set_combo_by_data(
+            self.dataset_stage,
+            stage,
+            {
+                "base": "Base pretraining",
+                "instruction": "Instruction fine-tune",
+                "conversation": "Conversation fine-tune",
+            },
+        )
+        self._update_online_dataset_stage_controls()
+
+    def _update_online_dataset_stage_controls(self) -> None:
+        """Show and enable online datasets for the selected training stage."""
+
+        if not hasattr(self, "dataset_stage"):
+            return
+        stage = self._dataset_stage_value()
+        allowed = set(dataset_ids_for_stage(stage))
+        include_online = self.include_conversation_datasets.isChecked()
+        for dataset_id, checkbox in getattr(self, "conversation_dataset_checks", {}).items():
+            visible = dataset_id in allowed
+            checkbox.setVisible(visible)
+            checkbox.setEnabled(include_online and visible)
+        self.conversation_sample_limit.setEnabled(include_online)
+        stage_name = dataset_stage_label(stage)
+        if include_online:
+            self.conversation_datasets_status.setText(f"{stage_name}: choose dataset checkboxes below to download/read.")
+        elif stage == "base":
+            self.conversation_datasets_status.setText("Base pretraining: choose optional online corpus datasets, or use local files only.")
+        elif stage == "instruction":
+            self.conversation_datasets_status.setText("Instruction fine-tune: Alpaca/Dolly/SlimOrca are available here. TinyStories is hidden.")
+        else:
+            self.conversation_datasets_status.setText("Conversation fine-tune: chat datasets are available here. TinyStories is hidden.")
+
+    def _selected_conversation_datasets(self) -> list[str]:
+        """Return selected built-in conversation dataset IDs.
+
+        Returns:
+            Selected dataset identifiers.
+        """
+
+        allowed = set(dataset_ids_for_stage(self._dataset_stage_value()))
+        return [
+            dataset_id
+            for dataset_id, checkbox in getattr(self, "conversation_dataset_checks", {}).items()
+            if dataset_id in allowed and checkbox.isChecked() and self.include_conversation_datasets.isChecked()
+        ]
+
+    def _set_selected_conversation_datasets(self, dataset_ids: list[str]) -> None:
+        """Restore selected conversation dataset checkboxes.
+
+        Args:
+            dataset_ids: Dataset IDs to select.
+        """
+
+        selected = set(dataset_ids)
+        for dataset_id, checkbox in getattr(self, "conversation_dataset_checks", {}).items():
+            checkbox.setChecked(dataset_id in selected)
+            checkbox.setEnabled(self.include_conversation_datasets.isChecked() and dataset_id in dataset_ids_for_stage(self._dataset_stage_value()))
+        if hasattr(self, "conversation_sample_limit"):
+            self.conversation_sample_limit.setEnabled(self.include_conversation_datasets.isChecked())
+        if hasattr(self, "conversation_datasets_status"):
+            self._update_online_dataset_stage_controls()
+
+    def _training_launch_target_value(self) -> str:
+        """Return whether training should launch locally or remotely.
+
+        Returns:
+            ``local`` or ``remote``.
+        """
+
+        return "remote" if self.training_launch_target.currentText() == "Remote workers" else "local"
 
     def _architecture_style_config(self) -> dict[str, Any]:
         """Return ModelConfig keyword arguments for the selected block style.
@@ -2485,6 +3147,72 @@ class MainWindow(QMainWindow):
             "FP32": "fp32",
         }.get(self.precision.currentText(), "fp16")
 
+    def _training_mode_value(self) -> str:
+        """Return the selected training mode identifier.
+
+        Returns:
+            Stable training mode used by the trainer.
+        """
+
+        return {
+            "Pretrain from scratch": "pretrain",
+            "Fine-tune checkpoint": "fine_tune",
+            "Instruction fine-tune": "fine_tune",
+            "Conversation fine-tune": "fine_tune",
+        }.get(self.training_mode.currentText(), "pretrain")
+
+    def _training_stage_value(self) -> str:
+        """Return the higher-level training stage selected in the UI.
+
+        Returns:
+            Training stage identifier.
+        """
+
+        return {
+            "Pretrain from scratch": "base",
+            "Fine-tune checkpoint": "domain",
+            "Instruction fine-tune": "instruction",
+            "Conversation fine-tune": "conversation",
+        }.get(self.training_mode.currentText(), "base")
+
+    def _peft_method_value(self) -> str:
+        """Return the selected PEFT method identifier.
+
+        Returns:
+            Stable PEFT method used by the trainer.
+        """
+
+        return {
+            "Full fine-tune": "none",
+            "LoRA adapters": "lora",
+        }.get(self.peft_method.currentText(), "none")
+
+    def _lora_target_value(self) -> str:
+        """Return selected LoRA target groups.
+
+        Returns:
+            Comma-separated target group string.
+        """
+
+        return {
+            "Attention projections": "attention",
+            "MLP projections": "mlp",
+            "Attention + MLP": "attention,mlp",
+        }.get(self.lora_targets.currentText(), "attention")
+
+    def _update_training_mode_controls(self) -> None:
+        """Enable fine-tune controls only when fine-tuning is selected."""
+
+        enabled = self._training_mode_value() == "fine_tune"
+        lora_enabled = enabled and self._peft_method_value() == "lora"
+        self.fine_tune_checkpoint.setEnabled(enabled)
+        self.peft_method.setEnabled(enabled)
+        self.fine_tune_check_button.setEnabled(enabled)
+        self.lora_rank.setEnabled(lora_enabled)
+        self.lora_alpha.setEnabled(lora_enabled)
+        self.lora_dropout.setEnabled(lora_enabled)
+        self.lora_targets.setEnabled(lora_enabled)
+
     def _attention_type_value(self) -> str:
         """Return the selected attention layout identifier.
 
@@ -2509,6 +3237,53 @@ class MainWindow(QMainWindow):
             "SDPA / Flash when available": "sdpa",
             "Manual": "manual",
         }.get(self.attention_backend.currentText(), "sdpa")
+
+    def apply_training_profile(self) -> None:
+        """Apply the selected optimizer/scheduler profile."""
+
+        profile = self.training_profile.currentText()
+        if profile == "Low-memory":
+            self._set_combo_text(self.optimizer_name, "Adafactor")
+            self._set_combo_text(self.scheduler_name, "Cosine decay")
+            self.learning_rate.setValue(0.0002)
+            self.weight_decay.setValue(0.05)
+            self.min_lr_ratio.setValue(0.05)
+            self.max_grad_norm.setValue(1.0)
+            self._set_combo_text(self.precision, "BF16" if torch.cuda.is_available() else "FP32")
+            self._set_combo_text(self.attention_type, "Grouped-query")
+            self.kv_head_count.setValue(max(1, self.n_head.value() // 2))
+        elif profile == "Code fine-tune":
+            self._set_combo_text(self.optimizer_name, "AdamW")
+            self._set_combo_text(self.scheduler_name, "Cosine decay")
+            self.learning_rate.setValue(0.00005)
+            self.weight_decay.setValue(0.05)
+            self.min_lr_ratio.setValue(0.1)
+            self.max_grad_norm.setValue(0.5)
+            self.dropout.setValue(0.05)
+            self._set_combo_text(self.training_mode, "Fine-tune checkpoint")
+            self._set_combo_text(self.peft_method, "LoRA adapters")
+            self.lora_rank.setValue(8)
+            self.lora_alpha.setValue(16.0)
+            self.lora_dropout.setValue(0.05)
+            self._set_combo_text(self.lora_targets, "Attention projections")
+        elif profile == "Experimental Lion":
+            self._set_combo_text(self.optimizer_name, "Lion")
+            self._set_combo_text(self.scheduler_name, "One-cycle")
+            self.learning_rate.setValue(0.0001)
+            self.weight_decay.setValue(0.1)
+            self.min_lr_ratio.setValue(0.01)
+            self.max_grad_norm.setValue(1.0)
+        else:
+            self._set_combo_text(self.optimizer_name, "AdamW")
+            self._set_combo_text(self.scheduler_name, "Cosine decay")
+            self.learning_rate.setValue(0.0003)
+            self.weight_decay.setValue(0.1)
+            self.min_lr_ratio.setValue(0.1)
+            self.max_grad_norm.setValue(1.0)
+            self._set_combo_text(self.precision, "FP16")
+        self._update_training_mode_controls()
+        self.refresh_model_estimate()
+        self.training_log.append(f"Applied training profile: {profile}")
 
     def _tokenizer_strategy_reuses(self) -> bool:
         """Return whether current tokenizer strategy ignores vocabulary controls.
@@ -2544,6 +3319,201 @@ class MainWindow(QMainWindow):
         self.model_size_metric.setText(f"Model: {params / 1_000_000:.2f}M, ckpt {format_bytes(checkpoint_bytes)}")
         self.vram_estimate_metric.setText(f"VRAM est: {format_bytes(vram_bytes)}")
 
+    def _current_model_config(self, vocab_size: int = 1) -> ModelConfig:
+        """Build a model config from the current AI tab settings.
+
+        Args:
+            vocab_size: Tokenizer vocabulary size to use.
+
+        Returns:
+            Current model configuration.
+        """
+
+        return ModelConfig(
+            vocab_size=vocab_size,
+            context_length=self.train_context_length.value(),
+            embedding_size=self.n_embd.value(),
+            head_count=self.n_head.value(),
+            layer_count=self.n_layer.value(),
+            dropout=self.dropout.value(),
+            attention_type=self._attention_type_value(),
+            kv_head_count=self.kv_head_count.value(),
+            attention_backend=self._attention_backend_value(),
+            attention_window=self.attention_window.value(),
+            **self._architecture_style_config(),
+        )
+
+    def _current_training_config(
+        self,
+        resume_path: Optional[Path] = None,
+        training_mode: Optional[str] = None,
+    ) -> TrainingConfig:
+        """Build a training config from the current AI tab settings.
+
+        Args:
+            resume_path: Optional specific checkpoint to resume from.
+            training_mode: Optional explicit training mode override.
+
+        Returns:
+            Current training configuration.
+        """
+
+        return TrainingConfig(
+            output_dir=Path(self.model_dir.text()),
+            epochs=self.epochs.value(),
+            batch_size=self.batch_size.value(),
+            learning_rate=self.learning_rate.value(),
+            weight_decay=self.weight_decay.value(),
+            optimizer_name=self._optimizer_value(),
+            scheduler_name=self._scheduler_value(),
+            scheduler_min_lr_ratio=self.min_lr_ratio.value(),
+            polynomial_power=self.polynomial_power.value(),
+            gradient_accumulation=self.gradient_accumulation.value(),
+            warmup_steps=self.warmup_steps.value(),
+            eval_interval=self.eval_interval.value(),
+            max_eval_batches=self.max_eval_batches.value(),
+            save_interval=self.save_interval.value(),
+            data_loader_workers=self.data_loader_workers.value(),
+            max_grad_norm=self.max_grad_norm.value(),
+            device=self.device.currentText(),
+            use_amp=self.use_amp.isChecked(),
+            precision=self._precision_value(),
+            seed=self.seed.value(),
+            training_mode=training_mode or self._training_mode_value(),
+            fine_tune_from_checkpoint=(
+                Path(self.fine_tune_checkpoint.text())
+                if training_mode != "pretrain" and self.fine_tune_checkpoint.text().strip()
+                else None
+            ),
+            peft_method="none" if training_mode == "pretrain" else self._peft_method_value(),
+            lora_rank=self.lora_rank.value(),
+            lora_alpha=self.lora_alpha.value(),
+            lora_dropout=self.lora_dropout.value(),
+            lora_target_modules=self._lora_target_value(),
+            resume=self.resume_training.isChecked(),
+            resume_from_checkpoint=resume_path if self.resume_training.isChecked() else None,
+            require_compatible_resume=self.resume_safety.isChecked(),
+        )
+
+    def _current_training_vocab_size(self, data_dir: Path) -> int:
+        """Return the tokenizer vocabulary size for the current training dataset.
+
+        Args:
+            data_dir: Prepared dataset folder.
+
+        Returns:
+            Vocabulary size, or zero if unavailable.
+        """
+
+        summary_path = data_dir / "dataset_summary.json"
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
+            if vocab_size > 0:
+                return vocab_size
+        tokenizer_path = data_dir / "tokenizer.json"
+        if tokenizer_path.exists():
+            tokenizer_data = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+            vocab = tokenizer_data.get("model", {}).get("vocab", {})
+            if isinstance(vocab, dict):
+                return len(vocab)
+        return 0
+
+    def _selected_resume_path(self) -> Optional[Path]:
+        """Return the selected or latest checkpoint path.
+
+        Returns:
+            Checkpoint path, or ``None`` when no checkpoint exists.
+        """
+
+        if self.resume_checkpoint.text().strip():
+            return Path(self.resume_checkpoint.text())
+        return latest_checkpoint(Path(self.model_dir.text()) / "checkpoints")
+
+    def preview_resume_compatibility(self) -> None:
+        """Preview whether the selected checkpoint can resume safely."""
+
+        if not self.resume_training.isChecked():
+            self.resume_training_preview.setText("[INFO] Resume latest is off. Enable resume to continue from a checkpoint.")
+            return
+        resume_path = self._selected_resume_path()
+        if resume_path is None:
+            self.resume_training_preview.setText("[INFO] No checkpoint found in the current model folder.")
+            return
+        if not resume_path.exists():
+            self.resume_training_preview.setText(f"[BLOCK] Checkpoint does not exist:\n{resume_path}")
+            return
+        try:
+            vocab_size = self._current_training_vocab_size(Path(self.train_data_dir.text()))
+            if vocab_size <= 0:
+                self.resume_training_preview.setText("[BLOCK] Could not determine current dataset tokenizer vocabulary size.")
+                return
+            model_config = self._current_model_config(vocab_size=vocab_size)
+            training_config = self._current_training_config(resume_path)
+            model_config.validate()
+            training_config.validate()
+            report = check_resume_compatibility(resume_path, model_config, training_config)
+            errors = list(report.errors)
+            if training_config.require_compatible_resume:
+                if not report.can_load_optimizer_state:
+                    errors.append("Safe resume requires matching optimizer state.")
+                if not report.can_load_scheduler_state:
+                    errors.append("Safe resume requires matching scheduler state.")
+                if not report.can_load_scaler_state:
+                    errors.append("Safe resume requires matching AMP scaler state.")
+            lines: list[str] = []
+            if errors:
+                lines.append("[BLOCK] Resume is not safe with the current settings.")
+            elif report.warnings:
+                lines.append("[WARN] Resume is possible, but settings changed.")
+            else:
+                lines.append("[OK] Checkpoint can resume with the current settings.")
+            lines.extend(f"[OK] {line}" for line in report.info)
+            lines.extend(f"[WARN] {line}" for line in report.warnings)
+            lines.extend(f"[BLOCK] {line}" for line in errors)
+            if not training_config.require_compatible_resume and not errors:
+                lines.append("[INFO] Safe resume is off. Compatible weights will load; incompatible optimizer state may be skipped.")
+            self.resume_training_preview.setText("\n".join(lines))
+        except Exception as exc:
+            self.resume_training_preview.setText(f"[BLOCK] Could not check resume compatibility:\n{exc}")
+
+    def preview_fine_tune_compatibility(self) -> None:
+        """Preview whether the selected checkpoint can be used for fine-tuning."""
+
+        base_path = Path(self.fine_tune_checkpoint.text()) if self.fine_tune_checkpoint.text().strip() else None
+        if base_path is None:
+            self.fine_tune_preview.setText("[BLOCK] Choose a base checkpoint for fine-tuning.")
+            return
+        if not base_path.exists():
+            self.fine_tune_preview.setText(f"[BLOCK] Fine-tune base checkpoint does not exist:\n{base_path}")
+            return
+        try:
+            vocab_size = self._current_training_vocab_size(Path(self.train_data_dir.text()))
+            if vocab_size <= 0:
+                self.fine_tune_preview.setText("[BLOCK] Could not determine current dataset tokenizer vocabulary size.")
+                return
+            model_config = self._current_model_config(vocab_size=vocab_size)
+            training_config = self._current_training_config()
+            model_config.validate()
+            report = check_resume_compatibility(base_path, model_config, training_config)
+            lines: list[str] = []
+            if report.errors:
+                lines.append("[BLOCK] Base checkpoint cannot be fine-tuned with the current model/dataset settings.")
+            else:
+                lines.append("[OK] Base checkpoint weights can be used for fine-tuning.")
+            lines.extend(f"[OK] {line}" for line in report.info)
+            behavior_warnings = [
+                warning for warning in report.warnings
+                if not warning.startswith("Optimizer changed:") and not warning.startswith("LR scheduler changed:")
+            ]
+            lines.extend(f"[WARN] {line}" for line in behavior_warnings)
+            lines.extend(f"[BLOCK] {line}" for line in report.errors)
+            if not report.errors:
+                lines.append("[INFO] Fine-tuning starts fresh optimizer, scheduler, and scaler state.")
+            self.fine_tune_preview.setText("\n".join(lines))
+        except Exception as exc:
+            self.fine_tune_preview.setText(f"[BLOCK] Could not check fine-tune compatibility:\n{exc}")
+
     def _training_history_path(self) -> Path:
         """Return the training history path for the selected model folder.
 
@@ -2572,43 +3542,8 @@ class MainWindow(QMainWindow):
     def refresh_model_estimate(self) -> None:
         """Refresh model size, rough VRAM, and run history widgets."""
 
-        model_config = ModelConfig(
-            vocab_size=1,
-            context_length=self.train_context_length.value(),
-            embedding_size=self.n_embd.value(),
-            head_count=self.n_head.value(),
-            layer_count=self.n_layer.value(),
-            dropout=self.dropout.value(),
-            attention_type=self._attention_type_value(),
-            kv_head_count=self.kv_head_count.value(),
-            attention_backend=self._attention_backend_value(),
-            attention_window=self.attention_window.value(),
-            **self._architecture_style_config(),
-        )
-        training_config = TrainingConfig(
-            output_dir=Path(self.model_dir.text()),
-            epochs=self.epochs.value(),
-            batch_size=self.batch_size.value(),
-            learning_rate=self.learning_rate.value(),
-            weight_decay=self.weight_decay.value(),
-            optimizer_name=self._optimizer_value(),
-            scheduler_name=self._scheduler_value(),
-            scheduler_min_lr_ratio=self.min_lr_ratio.value(),
-            polynomial_power=self.polynomial_power.value(),
-            gradient_accumulation=self.gradient_accumulation.value(),
-            warmup_steps=self.warmup_steps.value(),
-            eval_interval=self.eval_interval.value(),
-            max_eval_batches=self.max_eval_batches.value(),
-            save_interval=self.save_interval.value(),
-            data_loader_workers=self.data_loader_workers.value(),
-            max_grad_norm=self.max_grad_norm.value(),
-            device=self.device.currentText(),
-            use_amp=self.use_amp.isChecked(),
-            precision=self._precision_value(),
-            seed=self.seed.value(),
-            resume=self.resume_training.isChecked(),
-            require_compatible_resume=self.resume_safety.isChecked(),
-        )
+        model_config = self._current_model_config()
+        training_config = self._current_training_config()
         data_dir = Path(self.train_data_dir.text())
         train_tokens = max(model_config.context_length * training_config.batch_size, 1)
         try:
@@ -2671,7 +3606,7 @@ class MainWindow(QMainWindow):
         history.append(entry)
         history_path.write_text(json.dumps(history[-200:], indent=2), encoding="utf-8")
         self.history_metric.setText(f"Runs: {len(history[-200:])}")
-        self.training_log.append(f"Training history updated: {history_path}")
+        (self.active_training_log or self.training_log).append(f"Training history updated: {history_path}")
 
     def _run_training_preflight(self, model_config: ModelConfig, training_config: TrainingConfig) -> bool:
         """Run pre-training checklist and disk-space guard.
@@ -2684,6 +3619,7 @@ class MainWindow(QMainWindow):
             True when training may continue.
         """
 
+        log = self.active_training_log or self.training_log
         data_dir = Path(self.train_data_dir.text())
         output_dir = Path(self.model_dir.text())
         errors: list[str] = []
@@ -2739,6 +3675,21 @@ class MainWindow(QMainWindow):
             training_config.validate()
         except Exception as exc:
             errors.append(f"Training options are invalid: {exc}")
+        if model_config.attention_backend == "sdpa":
+            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                if training_config.device == "cuda" and torch.cuda.is_available():
+                    flash_enabled = bool(getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)())
+                    info.append("Attention backend: SDPA selected; Flash Attention may be used by PyTorch." if flash_enabled else "Attention backend: SDPA selected; CUDA flash kernel is not enabled.")
+                else:
+                    info.append("Attention backend: SDPA selected; CPU/backend fallback will be used if needed.")
+            else:
+                warnings.append("SDPA attention selected, but this PyTorch build does not expose scaled_dot_product_attention.")
+        else:
+            warnings.append("Manual attention backend selected. This is useful for debugging but can be slower.")
+        if training_config.peft_method == "lora":
+            info.append(
+                "PEFT: LoRA adapters enabled. Intermediate checkpoints will save adapter weights; final_model.pt will be merged."
+            )
 
         if training_config.device == "cuda" and not torch.cuda.is_available():
             errors.append("CUDA is selected, but PyTorch cannot use CUDA on this machine.")
@@ -2751,10 +3702,54 @@ class MainWindow(QMainWindow):
         if sys.platform.startswith("win") and training_config.data_loader_workers > 4:
             warnings.append("High CPU worker counts can duplicate dataset memory on Windows. Start with 2-4 workers and increase carefully.")
 
-        if training_config.resume_from_checkpoint and not Path(training_config.resume_from_checkpoint).exists():
-            errors.append(f"Selected resume checkpoint does not exist: {training_config.resume_from_checkpoint}")
-        elif training_config.resume and not (output_dir / "checkpoints").exists():
-            info.append("Resume latest is enabled, but no checkpoint folder exists yet. A new run will start.")
+        active_resume_path: Optional[Path] = None
+        resume_path = training_config.resume_from_checkpoint if training_config.resume else None
+        if resume_path and not Path(resume_path).exists():
+            errors.append(f"Selected resume checkpoint does not exist: {resume_path}")
+        elif training_config.resume:
+            if resume_path is None:
+                resume_path = latest_checkpoint(output_dir / "checkpoints")
+            if resume_path is None:
+                info.append("Resume latest is enabled, but no checkpoint exists yet.")
+            else:
+                active_resume_path = Path(resume_path)
+                try:
+                    compatibility = check_resume_compatibility(active_resume_path, model_config, training_config)
+                    info.extend(compatibility.info)
+                    warnings.extend(compatibility.warnings)
+                    errors.extend(compatibility.errors)
+                    if training_config.require_compatible_resume:
+                        if not compatibility.can_load_optimizer_state:
+                            errors.append("Safe resume requires matching optimizer state.")
+                        if not compatibility.can_load_scheduler_state:
+                            errors.append("Safe resume requires matching scheduler state.")
+                        if not compatibility.can_load_scaler_state:
+                            errors.append("Safe resume requires matching AMP scaler state.")
+                except Exception as exc:
+                    errors.append(f"Could not inspect resume checkpoint: {exc}")
+        if training_config.training_mode == "fine_tune" and active_resume_path is None:
+            base_path = training_config.fine_tune_from_checkpoint
+            if base_path is None:
+                errors.append("Fine-tune mode requires a base checkpoint.")
+            elif not Path(base_path).exists():
+                errors.append(f"Fine-tune base checkpoint does not exist: {base_path}")
+            else:
+                try:
+                    compatibility = check_resume_compatibility(Path(base_path), model_config, training_config)
+                    info.append(f"Fine-tune base checkpoint: {Path(base_path).name}.")
+                    warnings.extend(
+                        warning for warning in compatibility.warnings
+                        if not warning.startswith("Optimizer changed:") and not warning.startswith("LR scheduler changed:")
+                    )
+                    errors.extend(compatibility.errors)
+                    if not compatibility.errors:
+                        info.append("Fine-tune base weights are compatible. Optimizer state will start fresh.")
+                except Exception as exc:
+                    errors.append(f"Could not inspect fine-tune base checkpoint: {exc}")
+        elif training_config.training_mode == "pretrain" and active_resume_path is None:
+            info.append("A fresh pretraining run will start from random weights.")
+        elif training_config.training_mode == "fine_tune" and active_resume_path is not None:
+            info.append("Existing run checkpoint found; training will resume that run instead of reloading the fine-tune base.")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         estimate = estimate_training_resources(model_config, training_config, train_tokens)
@@ -2783,14 +3778,14 @@ class MainWindow(QMainWindow):
         if checkpoint_count > 50:
             warnings.append("Save interval may create many checkpoints. Increase Save every or clean old checkpoints.")
 
-        self.training_log.clear()
-        self.training_log.append("Pre-training checklist")
+        log.clear()
+        log.append("Training checklist")
         for line in info:
-            self.training_log.append(f"[OK] {line}")
+            log.append(f"[OK] {line}")
         for line in warnings:
-            self.training_log.append(f"[WARN] {line}")
+            log.append(f"[WARN] {line}")
         for line in errors:
-            self.training_log.append(f"[ERROR] {line}")
+            log.append(f"[ERROR] {line}")
 
         if errors:
             self.project_state.setText("Training blocked")
@@ -2809,45 +3804,20 @@ class MainWindow(QMainWindow):
     def start_training(self) -> None:
         """Collect training options and start model training."""
 
-        model_config = ModelConfig(
-            vocab_size=1,
-            context_length=self.train_context_length.value(),
-            embedding_size=self.n_embd.value(),
-            head_count=self.n_head.value(),
-            layer_count=self.n_layer.value(),
-            dropout=self.dropout.value(),
-            attention_type=self._attention_type_value(),
-            kv_head_count=self.kv_head_count.value(),
-            attention_backend=self._attention_backend_value(),
-            attention_window=self.attention_window.value(),
-            **self._architecture_style_config(),
-        )
+        if self._training_launch_target_value() == "remote":
+            self.publish_remote_training_job()
+            return
+        self.active_training_log = self.training_log
+        self.active_training_progress = self.training_progress
+        self.active_training_final_button_text = "Start Training"
         resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
-        training_config = TrainingConfig(
-            output_dir=Path(self.model_dir.text()),
-            epochs=self.epochs.value(),
-            batch_size=self.batch_size.value(),
-            learning_rate=self.learning_rate.value(),
-            weight_decay=self.weight_decay.value(),
-            optimizer_name=self._optimizer_value(),
-            scheduler_name=self._scheduler_value(),
-            scheduler_min_lr_ratio=self.min_lr_ratio.value(),
-            polynomial_power=self.polynomial_power.value(),
-            gradient_accumulation=self.gradient_accumulation.value(),
-            warmup_steps=self.warmup_steps.value(),
-            eval_interval=self.eval_interval.value(),
-            max_eval_batches=self.max_eval_batches.value(),
-            save_interval=self.save_interval.value(),
-            data_loader_workers=self.data_loader_workers.value(),
-            max_grad_norm=self.max_grad_norm.value(),
-            device=self.device.currentText(),
-            use_amp=self.use_amp.isChecked(),
-            precision=self._precision_value(),
-            seed=self.seed.value(),
-            resume=self.resume_training.isChecked(),
-            resume_from_checkpoint=resume_path if self.resume_training.isChecked() else None,
-            require_compatible_resume=self.resume_safety.isChecked(),
-        )
+        dataset_dir = Path(self.train_data_dir.text())
+        vocab_size = self._current_training_vocab_size(dataset_dir)
+        if vocab_size <= 0:
+            QMessageBox.warning(self, "Training blocked", "Could not determine tokenizer vocabulary size. Prepare the dataset first.")
+            return
+        model_config = self._current_model_config(vocab_size=vocab_size)
+        training_config = self._current_training_config(resume_path, training_mode="pretrain")
         if not self._run_training_preflight(model_config, training_config):
             return
         self._init_telemetry_store(Path(self.model_dir.text()))
@@ -2890,7 +3860,7 @@ class MainWindow(QMainWindow):
         self.train_status.setText("Training: running")
         self._run_task(
             run_training_job,
-            (Path(self.train_data_dir.text()), model_config, training_config),
+            (dataset_dir, model_config, training_config),
             self._training_finished,
             self.training_log,
             self.training_progress,
@@ -2898,6 +3868,49 @@ class MainWindow(QMainWindow):
             button=self.train_button,
             stop_button=self.stop_training_button,
             busy_text="Training",
+        )
+
+    def start_fine_tuning(self) -> None:
+        """Collect fine-tuning options and start adaptation training."""
+
+        self.active_training_log = self.fine_tune_log
+        self.active_training_progress = self.fine_tune_progress
+        self.active_training_final_button_text = "Start Fine-Tune"
+        resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
+        dataset_dir = Path(self.train_data_dir.text())
+        vocab_size = self._current_training_vocab_size(dataset_dir)
+        if vocab_size <= 0:
+            QMessageBox.warning(self, "Fine-tune blocked", "Could not determine tokenizer vocabulary size. Prepare the fine-tuning dataset first.")
+            return
+        model_config = self._current_model_config(vocab_size=vocab_size)
+        training_config = self._current_training_config(resume_path, training_mode="fine_tune")
+        if not self._run_training_preflight(model_config, training_config):
+            return
+        self._init_telemetry_store(Path(self.model_dir.text()))
+        self.fine_tune_log.append("")
+        self.fine_tune_progress.setValue(0)
+        self.training_progress.setValue(0)
+        self.loss_chart.clear()
+        self.optimization_chart.clear()
+        self.stability_chart.clear()
+        self.throughput_chart.clear()
+        self.memory_chart.clear()
+        self.live_progress.setValue(0)
+        self.live_sample_text.setText("Training text: -")
+        self.live_flow.set_state(self.n_layer.value(), self.n_head.value(), 0, None)
+        self.fine_tune_log.append("Fine-tuning started...")
+        self.project_state.setText("Fine-tuning")
+        self.train_status.setText("Training: fine-tuning")
+        self._run_task(
+            run_fine_tuning_job,
+            (dataset_dir, model_config, training_config, self._training_stage_value()),
+            self._training_finished,
+            self.fine_tune_log,
+            self.fine_tune_progress,
+            with_progress=True,
+            button=self.fine_tune_button,
+            stop_button=self.stop_fine_tune_button,
+            busy_text="Fine-tuning",
         )
 
     @Slot(object)
@@ -2908,23 +3921,29 @@ class MainWindow(QMainWindow):
             result: Training result.
         """
 
-        self.training_progress.setValue(100)
+        log = self.active_training_log or self.training_log
+        progress = self.active_training_progress or self.training_progress
+        progress.setValue(100)
+        if progress is not self.training_progress:
+            self.training_progress.setValue(100)
         if hasattr(self, "live_progress"):
             self.live_progress.setValue(100)
-        self.training_log.append(f"Saved model: {result.checkpoint_path}")
-        self.training_log.append(f"Final train loss: {result.final_train_loss:.4f}")
+        log.append(f"Saved model: {result.checkpoint_path}")
+        log.append(f"Final train loss: {result.final_train_loss:.4f}")
         if result.final_val_loss is not None:
-            self.training_log.append(f"Final validation loss: {result.final_val_loss:.4f}")
+            log.append(f"Final validation loss: {result.final_val_loss:.4f}")
         self.export_model_dir.setText(str(Path(self.model_dir.text())))
         if getattr(result, "stopped", False):
             self.project_state.setText("Training stopped")
             self.train_status.setText("Training: stopped, checkpoint saved")
-            self.training_log.append("Training stopped safely. Resume from this checkpoint or the latest checkpoint.")
+            log.append("Training stopped safely. Resume from this checkpoint or the latest checkpoint.")
         else:
             self.project_state.setText("Training complete")
             self.train_status.setText(f"Training: loss {result.final_train_loss:.4f}")
         self._append_training_history(result)
-        self._clear_button_busy("Start Training")
+        self._clear_button_busy(self.active_training_final_button_text)
+        self.active_training_log = None
+        self.active_training_progress = None
 
     def run_benchmark(self) -> None:
         """Run benchmark prompts against the current trained model."""
@@ -2965,7 +3984,8 @@ class MainWindow(QMainWindow):
         self.benchmark_progress.setRange(0, 100)
         self.benchmark_progress.setValue(100)
         self.benchmark_log.append(
-            f"Benchmark complete: {result.prompt_count} prompt(s), {result.total_seconds:.2f}s."
+            f"Benchmark complete: {result.prompt_count} prompt(s), {result.total_seconds:.2f}s, "
+            f"{result.total_generated_tokens} generated token(s), {result.tokens_per_second:.2f} tok/s."
         )
         self.benchmark_log.append(f"Benchmark saved: {result.output_path}")
         self.project_state.setText("Benchmark complete")
@@ -3240,11 +4260,14 @@ class MainWindow(QMainWindow):
 def main() -> None:
     """Launch the PySide6 desktop application."""
 
+    log_file = setup_logging()
+    qInstallMessageHandler(qt_message_handler)
+    LOGGER.info("Starting Micro LLM Creator. Log file: %s", log_file)
     if sys.platform == "win32":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
         except Exception:
-            pass
+            LOGGER.exception("Could not set Windows app user model ID")
     app = QApplication(sys.argv)
     app.setFont(QFont("Arial", 10))
     app.setWindowIcon(MainWindow._static_lightning_icon())

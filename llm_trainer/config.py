@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,6 +30,9 @@ class DatasetConfig:
         prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
         tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
         tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
+        dataset_stage: Intended dataset purpose: base, instruction, or conversation.
+        conversation_datasets: Built-in Hugging Face conversation dataset IDs to include.
+        conversation_sample_limit: Maximum rows to read from each selected conversation dataset. Zero means no limit.
     """
 
     input_dir: Path
@@ -50,6 +53,9 @@ class DatasetConfig:
     prepare_mode: str = "incremental"
     tokenizer_strategy: str = "auto"
     tokenizer_path: Optional[Path] = None
+    dataset_stage: str = "base"
+    conversation_datasets: list[str] = field(default_factory=list)
+    conversation_sample_limit: int = 20000
 
 
 @dataclass
@@ -164,6 +170,13 @@ class TrainingConfig:
         precision: Numeric precision policy: fp32, fp16, or bf16.
         device: Training device, usually "cuda" or "cpu".
         seed: Random seed for repeatability.
+        training_mode: Training mode: pretrain or fine_tune.
+        fine_tune_from_checkpoint: Optional checkpoint used as the base model for fine-tuning.
+        peft_method: Parameter-efficient fine-tuning method: none or lora.
+        lora_rank: LoRA adapter rank.
+        lora_alpha: LoRA scaling alpha.
+        lora_dropout: Dropout applied before LoRA adapters.
+        lora_target_modules: Comma-separated LoRA target groups.
         resume: Whether to resume from checkpoints.
         resume_from_checkpoint: Optional exact checkpoint path to resume from.
         require_compatible_resume: Validate tokenizer/model compatibility before resuming.
@@ -189,6 +202,13 @@ class TrainingConfig:
     precision: str = "fp16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 1337
+    training_mode: str = "pretrain"
+    fine_tune_from_checkpoint: Optional[Path] = None
+    peft_method: str = "none"
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "attention"
     resume: bool = True
     resume_from_checkpoint: Optional[Path] = None
     require_compatible_resume: bool = True
@@ -206,6 +226,21 @@ class TrainingConfig:
             raise ValueError("scheduler_name must be warmup_linear, cosine, polynomial, one_cycle, or constant")
         if self.precision not in {"fp32", "fp16", "bf16"}:
             raise ValueError("precision must be fp32, fp16, or bf16")
+        if self.training_mode not in {"pretrain", "fine_tune"}:
+            raise ValueError("training_mode must be pretrain or fine_tune")
+        if self.training_mode == "fine_tune" and self.fine_tune_from_checkpoint is None:
+            raise ValueError("fine_tune_from_checkpoint is required for fine_tune mode")
+        if self.peft_method not in {"none", "lora"}:
+            raise ValueError("peft_method must be none or lora")
+        if self.peft_method == "lora":
+            if self.training_mode != "fine_tune":
+                raise ValueError("LoRA requires fine_tune training mode")
+            if self.lora_rank <= 0:
+                raise ValueError("lora_rank must be greater than 0")
+            if self.lora_alpha <= 0.0:
+                raise ValueError("lora_alpha must be greater than 0")
+            if self.lora_dropout < 0.0 or self.lora_dropout > 0.9:
+                raise ValueError("lora_dropout must be between 0 and 0.9")
         if self.scheduler_min_lr_ratio < 0.0 or self.scheduler_min_lr_ratio > 1.0:
             raise ValueError("scheduler_min_lr_ratio must be between 0 and 1")
         if self.polynomial_power <= 0.0:

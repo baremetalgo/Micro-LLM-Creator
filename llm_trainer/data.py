@@ -416,6 +416,10 @@ def format_document_for_training(
         if generate_instruction_samples:
             return format_code_instruction_sample(document, language, source, reasoning_sample_mode)
         return f"<code language=\"{language}\" source=\"{source}\">\n{document.text}\n</code>"
+    if document.kind == "conversation":
+        return f"<sample type=\"conversation\" source=\"{source}\">\n{document.text}\n</sample>"
+    if document.kind == "instruction":
+        return f"<sample type=\"instruction\" source=\"{source}\">\n{document.text}\n</sample>"
     return f"<sample type=\"prose\" source=\"{source}\">\n{document.text}\n</sample>"
 
 

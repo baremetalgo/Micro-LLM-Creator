@@ -127,6 +127,14 @@ def build_training_tab(window) -> QWidget:
     window._tip(window.learning_rate, "Optimizer step size. Too high can destabilize training; too low trains slowly.")
     window.weight_decay = window._double_spin(0.0, 1.0, 0.1, 0.01, 4)
     window._tip(window.weight_decay, "Weight decay regularization. Helps control overfitting by discouraging large weights.")
+    window.training_profile = QComboBox()
+    window.training_profile.addItems(["Stable LLM", "Low-memory", "Code fine-tune", "Experimental Lion"])
+    window.training_profile.setMaximumWidth(260)
+    window._tip(window.training_profile, "Applies a practical optimizer, scheduler, precision, and regularization profile.")
+    window.apply_training_profile_button = QPushButton("Apply Profile")
+    window.apply_training_profile_button.setMaximumWidth(160)
+    window.apply_training_profile_button.clicked.connect(window.apply_training_profile)
+    window._tip(window.apply_training_profile_button, "Apply the selected training profile to the controls below.")
     window.optimizer_name = QComboBox()
     window.optimizer_name.addItems(["AdamW", "Adam", "Lion", "Adafactor"])
     window.optimizer_name.setMaximumWidth(260)
@@ -193,8 +201,14 @@ def build_training_tab(window) -> QWidget:
     )
     window.resume_checkpoint = QLineEdit()
     window._tip(window.resume_checkpoint, "Optional specific checkpoint file to resume from instead of the latest checkpoint.")
+    window.resume_check_button = QPushButton("Check Resume")
+    window.resume_check_button.setMaximumWidth(180)
+    window.resume_check_button.clicked.connect(window.preview_resume_compatibility)
+    window._tip(window.resume_check_button, "Inspect checkpoint compatibility before starting training.")
     right.addRow("Epochs", window.epochs)
     right.addRow("Batch", window.batch_size)
+    right.addRow("Profile", window.training_profile)
+    right.addRow("", window.apply_training_profile_button)
     right.addRow("LR", window.learning_rate)
     right.addRow("Decay", window.weight_decay)
     right.addRow("Optimizer", window.optimizer_name)
@@ -211,6 +225,14 @@ def build_training_tab(window) -> QWidget:
     right.addRow("Seed", window.seed)
     runtime = QFormLayout()
     window._configure_form(runtime)
+    window.training_launch_target = QComboBox()
+    window.training_launch_target.addItems(["Local machine", "Remote workers"])
+    window.training_launch_target.setMaximumWidth(260)
+    window._tip(
+        window.training_launch_target,
+        "Local runs training on this computer. Remote publishes a job for available workers to claim from Job Manager.",
+    )
+    runtime.addRow("Launch", window.training_launch_target)
     runtime.addRow("Device", window.device)
     runtime.addRow("Hardware", window.device_info)
     runtime.addRow("", window.use_amp)
@@ -218,6 +240,7 @@ def build_training_tab(window) -> QWidget:
     runtime.addRow("", window.resume_training)
     runtime.addRow("", window.resume_safety)
     runtime.addRow("Checkpoint", window._path_row(window.resume_checkpoint, directory=False))
+    runtime.addRow("", window.resume_check_button)
 
     window.training_cards = [
         window._card("MODEL ARCHITECTURE", left),
@@ -237,6 +260,17 @@ def build_training_tab(window) -> QWidget:
     window.training_controls = controls
     left_zone.addWidget(controls, 0)
     right_zone.addWidget(window._card("RUNTIME CONTROL", runtime), 0)
+
+    window.resume_training_preview = QTextEdit()
+    window.resume_training_preview.setReadOnly(True)
+    window.resume_training_preview.setMinimumHeight(110)
+    window.resume_training_preview.setMaximumHeight(180)
+    window.resume_training_preview.setText("No compatibility check has been run.")
+    window.resume_preview = window.resume_training_preview
+    window._tip(window.resume_training_preview, "Compatibility report for the selected or latest checkpoint.")
+    resume_preview_layout = QVBoxLayout()
+    resume_preview_layout.addWidget(window.resume_training_preview)
+    right_zone.addWidget(window._card("RESUME COMPATIBILITY", resume_preview_layout), 0)
 
     window.train_button = QPushButton("Start Training")
     window._tip(window.train_button, "Start or resume training using the selected model and optimizer settings.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import torch
 import PyPDF2
 
 from .config import DatasetConfig, ModelConfig, TrainingConfig, dataclass_to_jsonable
+from .conversation_datasets import CONVERSATION_DATASET_PRESETS, dataset_ids_for_stage, load_conversation_documents
 from .data import (
     SUPPORTED_CODE_SUFFIXES,
     SUPPORTED_TEXT_SUFFIXES,
@@ -27,6 +29,9 @@ from .data import (
 from .lineage import read_json, record_dataset_version, stable_json_hash, utc_timestamp, write_json
 from .tokenizer import PAD_TOKEN, encode_text, load_tokenizer, token_id, train_tokenizer, validate_training_tokenizer
 from .training import TrainingResult, latest_checkpoint, split_tokens, train_model
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +49,7 @@ class DatasetBuildResult:
         warning: Optional dataset quality warning.
         code_sample_count: Number of code samples.
         prose_sample_count: Number of prose samples.
+        conversation_sample_count: Number of conversation/instruction samples.
         cached_file_count: Number of unchanged source files reused from cache.
         processed_file_count: Number of source files extracted this run.
         skipped_file_count: Number of files with no readable text.
@@ -62,6 +68,7 @@ class DatasetBuildResult:
     warning: Optional[str] = None
     code_sample_count: int = 0
     prose_sample_count: int = 0
+    conversation_sample_count: int = 0
     cached_file_count: int = 0
     processed_file_count: int = 0
     skipped_file_count: int = 0
@@ -137,6 +144,7 @@ def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Opti
         percent: Optional progress percentage.
     """
 
+    LOGGER.info(message)
     if progress:
         progress({"message": message, "percent": percent})
 
@@ -602,12 +610,22 @@ def scan_dataset_preview(
     """
 
     _emit(progress, "Scanning supported source files...", 5)
-    paths = _supported_source_paths_cancellable(
-        config.input_dir,
-        config.code_training_mode,
-        config.include_source_code,
-        should_stop,
-    )
+    if config.input_dir.exists():
+        paths = _supported_source_paths_cancellable(
+            config.input_dir,
+            config.code_training_mode,
+            config.include_source_code,
+            should_stop,
+        )
+    elif config.conversation_datasets:
+        paths = []
+    else:
+        paths = _supported_source_paths_cancellable(
+            config.input_dir,
+            config.code_training_mode,
+            config.include_source_code,
+            should_stop,
+        )
     suffix_counts: dict[str, int] = {}
     total_bytes = 0
     for path in paths:
@@ -622,8 +640,15 @@ def scan_dataset_preview(
     summary = read_json(config.output_dir / "dataset_summary.json", default={}) or {}
     prepared = all((config.output_dir / name).exists() for name in ("tokenizer.json", "train_tokens.json", "val_tokens.json"))
     issues: list[str] = []
-    if not paths:
+    if not paths and not config.conversation_datasets:
         issues.append("No supported source files found.")
+    if config.conversation_datasets:
+        labels = [
+            CONVERSATION_DATASET_PRESETS[item].label
+            for item in config.conversation_datasets
+            if item in CONVERSATION_DATASET_PRESETS
+        ]
+        issues.append(f"Conversation datasets selected: {', '.join(labels)}.")
     if total_bytes < 100_000:
         issues.append("Source content appears small for meaningful LLM training.")
     if prepared and summary:
@@ -719,8 +744,9 @@ def scan_dataset_preview(
     code_preview_count = summary_code_count or sum(1 for preview in all_previews if preview.get("kind") == "code")
     prose_preview_count = summary_prose_count or sum(1 for preview in all_previews if preview.get("kind") != "code")
     balance = _balance_label(code_preview_count, prose_preview_count, config.code_training_mode)
+    effective_source_count = len(paths) + len(config.conversation_datasets)
     readiness_score, readiness_label, readiness_reasons = _readiness_report(
-        source_file_count=len(paths),
+        source_file_count=effective_source_count,
         total_bytes=total_bytes,
         prepared=prepared,
         summary=summary,
@@ -732,7 +758,7 @@ def scan_dataset_preview(
     )
     _emit(progress, "Dataset preview complete.", 100)
     return DatasetPreviewResult(
-        source_file_count=len(paths),
+        source_file_count=effective_source_count,
         prepared=prepared,
         total_bytes=total_bytes,
         suffix_counts=dict(sorted(suffix_counts.items())),
@@ -893,6 +919,9 @@ def _cache_key(config: DatasetConfig) -> str:
             "preserve_indentation": config.preserve_indentation,
             "generate_instruction_samples": config.generate_instruction_samples,
             "reasoning_sample_mode": config.reasoning_sample_mode,
+            "dataset_stage": config.dataset_stage,
+            "conversation_datasets": config.conversation_datasets,
+            "conversation_sample_limit": config.conversation_sample_limit,
         },
         sort_keys=True,
     )
@@ -937,11 +966,20 @@ def _load_documents_with_cache(
     key = _cache_key(config)
     force_reprocess = config.prepare_mode == "force_reprocess"
 
-    source_paths = supported_source_paths(
-        config.input_dir,
-        code_training_mode=config.code_training_mode,
-        include_source_code=config.include_source_code,
-    )
+    if config.input_dir.exists():
+        source_paths = supported_source_paths(
+            config.input_dir,
+            code_training_mode=config.code_training_mode,
+            include_source_code=config.include_source_code,
+        )
+    elif config.conversation_datasets:
+        source_paths = []
+    else:
+        source_paths = supported_source_paths(
+            config.input_dir,
+            code_training_mode=config.code_training_mode,
+            include_source_code=config.include_source_code,
+        )
     _emit(progress, f"Found {len(source_paths)} supported files in {config.input_dir}.", 8)
     documents: list[Any] = []
     cached_count = 0
@@ -1033,6 +1071,62 @@ def _load_documents_with_cache(
             "status": "cached" if can_use_cache else "processed",
         }
 
+    if config.conversation_datasets:
+        allowed_dataset_ids = set(dataset_ids_for_stage(config.dataset_stage))
+        skipped_stage_ids = [dataset_id for dataset_id in config.conversation_datasets if dataset_id not in allowed_dataset_ids]
+        selected_dataset_ids = [dataset_id for dataset_id in config.conversation_datasets if dataset_id in allowed_dataset_ids]
+        if skipped_stage_ids:
+            skipped_labels = [
+                CONVERSATION_DATASET_PRESETS[item].label
+                for item in skipped_stage_ids
+                if item in CONVERSATION_DATASET_PRESETS
+            ]
+            _emit(progress, f"Skipping dataset(s) not recommended for {config.dataset_stage}: {', '.join(skipped_labels)}.")
+        if not selected_dataset_ids:
+            _emit(progress, f"No online datasets selected for {config.dataset_stage}; continuing with local sources only.")
+            config.conversation_datasets = []
+            manifest["files"] = new_files
+            manifest["dataset_config"] = dataclass_to_jsonable(config)
+            manifest["cache_key"] = key
+            return (
+                sorted(documents, key=lambda document: (str(document.path), document.kind, document.language or "")),
+                manifest,
+                cached_count,
+                processed_count,
+                skipped_count,
+                failed_count,
+            )
+        hf_cache_dir = config.output_dir / "cache" / "huggingface"
+        labels = [
+            CONVERSATION_DATASET_PRESETS[item].label
+            for item in selected_dataset_ids
+            if item in CONVERSATION_DATASET_PRESETS
+        ]
+        _emit(progress, f"Online training datasets enabled: {', '.join(labels)}.", 8)
+        _emit(progress, f"Online training datasets will be cached in: {hf_cache_dir}", 8)
+        hf_documents = load_conversation_documents(
+            selected_dataset_ids,
+            config.conversation_sample_limit,
+            hf_cache_dir,
+            lowercase=config.lowercase,
+            progress=progress,
+            should_stop=should_stop,
+        )
+        documents.extend(hf_documents)
+        config.conversation_datasets = selected_dataset_ids
+        for dataset_id in selected_dataset_ids:
+            preset = CONVERSATION_DATASET_PRESETS.get(dataset_id)
+            new_files[f"hf://{dataset_id}"] = {
+                "path": f"hf://{dataset_id}",
+                "dataset": preset.hf_path if preset else dataset_id,
+                "config_name": preset.config_name if preset else "",
+                "split": preset.split if preset else "",
+                "sample_limit": config.conversation_sample_limit,
+                "cache_key": key,
+                "status": "processed",
+            }
+        processed_count += len(selected_dataset_ids)
+
     manifest["files"] = new_files
     manifest["dataset_config"] = dataclass_to_jsonable(config)
     manifest["cache_key"] = key
@@ -1087,10 +1181,13 @@ def build_dataset(
     selected_vocab_size = config.vocab_size or suggested_vocab_size
     warning = content_warning(character_count)
     code_sample_count = sum(1 for doc in documents if doc.kind == "code")
-    prose_sample_count = sum(1 for doc in documents if doc.kind != "code")
+    conversation_sample_count = sum(1 for doc in documents if doc.kind in {"conversation", "instruction"})
+    prose_sample_count = sum(1 for doc in documents if doc.kind not in {"code", "conversation", "instruction"})
     _emit(progress, f"Content size: {character_count:,} characters across {len(documents)} files.", 45)
     if config.code_training_mode:
         _emit(progress, f"Code mode: {code_sample_count:,} code samples, {prose_sample_count:,} prose samples.", 46)
+    if conversation_sample_count:
+        _emit(progress, f"Conversation data: {conversation_sample_count:,} dialogue/instruction samples.", 46)
     if cached_file_count or processed_file_count:
         _emit(progress, f"Cache: reused {cached_file_count:,} file(s), processed {processed_file_count:,} file(s).", 47)
     if skipped_file_count or failed_file_count:
@@ -1111,6 +1208,7 @@ def build_dataset(
         generate_instruction_samples=config.generate_instruction_samples,
         reasoning_sample_mode=config.reasoning_sample_mode,
     )
+    corpus_text = corpus_path.read_text(encoding="utf-8")
     tokenizer_path = config.output_dir / "tokenizer.json"
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
@@ -1127,7 +1225,7 @@ def build_dataset(
     _emit(progress, "Encoding corpus into token IDs...", 78)
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
-    tokens = encode_text(tokenizer, all_text)
+    tokens = encode_text(tokenizer, corpus_text)
     _emit(progress, f"Encoded {len(tokens):,} tokens.", 86)
     train_tokens, val_tokens = split_tokens(tokens, config.validation_split)
     _emit(progress, f"Training tokens: {len(train_tokens):,}; validation tokens: {len(val_tokens):,}.", 92)
@@ -1143,6 +1241,10 @@ def build_dataset(
         "val_token_count": len(val_tokens),
         "code_sample_count": code_sample_count,
         "prose_sample_count": prose_sample_count,
+        "conversation_sample_count": conversation_sample_count,
+        "dataset_stage": config.dataset_stage,
+        "conversation_datasets": config.conversation_datasets,
+        "conversation_sample_limit": config.conversation_sample_limit,
         "suggested_vocab_size": suggested_vocab_size,
         "tokenizer_vocab_size": tokenizer.get_vocab_size(),
         "tokenizer_sha256": file_sha256(tokenizer_path),
@@ -1176,6 +1278,7 @@ def build_dataset(
         warning,
         code_sample_count,
         prose_sample_count,
+        conversation_sample_count,
         cached_file_count,
         processed_file_count,
         skipped_file_count,
@@ -1226,6 +1329,7 @@ def _compatible_model_config(model_config: ModelConfig) -> dict[str, Any]:
             "position_encoding",
             "mlp_type",
             "rope_theta",
+            "attention_type",
         )
     }
 
@@ -1289,7 +1393,15 @@ def _validate_resume_compatibility(
         raise ValueError(f"Resume safety check failed: checkpoint has no model_config: {resume_path}")
 
     current = _compatible_model_config(model_config)
-    previous = {key: checkpoint_config.get(key) for key in current}
+    legacy_defaults = {
+        "bias": True,
+        "norm_type": "layernorm",
+        "position_encoding": "learned",
+        "mlp_type": "gelu",
+        "rope_theta": 10000.0,
+        "attention_type": "mha",
+    }
+    previous = {key: checkpoint_config.get(key, legacy_defaults.get(key)) for key in current}
     mismatches = {
         key: {"checkpoint": previous.get(key), "current": current.get(key)}
         for key in current
@@ -1377,6 +1489,16 @@ def train_from_dataset(
         "tokenizer_path": str(tokenizer_path),
         "tokenizer_vocab_size": tokenizer.get_vocab_size(),
         "tokenizer_sha256": file_sha256(tokenizer_path),
+        "training_mode": training_config.training_mode,
+        "fine_tune_from_checkpoint": (
+            str(training_config.fine_tune_from_checkpoint)
+            if training_config.fine_tune_from_checkpoint
+            else None
+        ),
+        "peft_method": training_config.peft_method,
+        "lora_rank": training_config.lora_rank if training_config.peft_method == "lora" else None,
+        "lora_alpha": training_config.lora_alpha if training_config.peft_method == "lora" else None,
+        "lora_target_modules": training_config.lora_target_modules if training_config.peft_method == "lora" else None,
         "resume_checkpoint": str(resume_path) if resume_path else None,
         "resume_safety_required": training_config.require_compatible_resume,
         "checkpoint_path": str(result.checkpoint_path),

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 
 import torch
 
 from .config import DatasetConfig, ModelConfig, TrainingConfig
+from .coordinator import run_coordinator_api
+from .coordinator.artifacts import create_job_artifact_bundle
+from .contracts import BackendKind
+from .contracts.jobs import RuntimeSpec, TrainingJobSpec
 from .evaluation import evaluate_checkpoint, normalize_prompts
 from .export import export_hf_microgpt_package
 from .services import build_dataset, train_from_dataset
 from .tokenizer import load_tokenizer
+from .worker import WorkerClientConfig, run_worker_client
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -54,6 +61,9 @@ def prepare(args: argparse.Namespace) -> None:
         prepare_mode=args.prepare_mode,
         tokenizer_strategy=args.tokenizer_strategy,
         tokenizer_path=Path(args.tokenizer_path) if args.tokenizer_path else None,
+        dataset_stage=args.dataset_stage,
+        conversation_datasets=[item.strip() for item in args.conversation_datasets.split(",") if item.strip()],
+        conversation_sample_limit=args.conversation_sample_limit,
     )
     result = build_dataset(config, progress=print_progress)
     print(
@@ -141,6 +151,81 @@ def export_hf(args: argparse.Namespace) -> None:
     print(f"Saved HF-style MicroGPT package: {output}")
 
 
+def coordinator_server(args: argparse.Namespace) -> None:
+    """Run the coordinator HTTP API server.
+
+    Args:
+        args: Parsed command-line arguments for the coordinator command.
+    """
+
+    print(f"Coordinator API listening on http://{args.host}:{args.port}")
+    print(f"Artifact root: {args.artifact_root}")
+    run_coordinator_api(args.host, args.port, Path(args.artifact_root) if args.artifact_root else None)
+
+
+def create_job_bundle(args: argparse.Namespace) -> None:
+    """Create a portable job artifact bundle.
+
+    Args:
+        args: Parsed command-line arguments for the bundle command.
+    """
+
+    tokenizer = load_tokenizer(Path(args.dataset_dir) / "tokenizer.json")
+    model_config = ModelConfig(
+        vocab_size=tokenizer.get_vocab_size(),
+        context_length=args.context_length,
+        embedding_size=args.embedding_size,
+        head_count=args.head_count,
+        layer_count=args.layer_count,
+        dropout=args.dropout,
+    )
+    training_config = TrainingConfig(
+        output_dir=Path(args.output_dir),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        device=args.device,
+    )
+    job = TrainingJobSpec.local(Path(args.dataset_dir), model_config, training_config)
+    job.runtime = RuntimeSpec(
+        backend=BackendKind.REMOTE_CLIENT,
+        device=args.device,
+        min_vram_gb=args.min_vram_gb,
+        tags=[item.strip() for item in args.tags.split(",") if item.strip()],
+    )
+    bundle = create_job_artifact_bundle(
+        job,
+        artifact_root=Path(args.artifact_root) if args.artifact_root else None,
+        base_url=args.base_url,
+    )
+    print(f"Created artifact bundle: {bundle}")
+    print(f"Bundle URL: {job.metadata['artifact_bundle_url']}")
+    print("Job JSON:")
+    print(json.dumps(job.to_jsonable(), indent=2))
+
+
+def worker_client(args: argparse.Namespace) -> None:
+    """Run a remote worker client.
+
+    Args:
+        args: Parsed command-line arguments for the worker client command.
+    """
+
+    labels = [item.strip() for item in args.labels.split(",") if item.strip()]
+    config = WorkerClientConfig(
+        coordinator_url=args.coordinator_url,
+        worker_id=args.worker_id,
+        device=args.device,
+        labels=labels,
+        heartbeat_interval_seconds=args.heartbeat_interval,
+        execute_jobs=args.execute,
+        claim_once=args.claim_once,
+        workspace_dir=Path(args.workspace_dir),
+    )
+    print(f"Worker {config.worker_id} connecting to {config.coordinator_url}")
+    run_worker_client(config)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser.
 
@@ -182,6 +267,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     prepare_parser.add_argument("--tokenizer_path", default=None)
+    prepare_parser.add_argument(
+        "--dataset_stage",
+        choices=["base", "instruction", "conversation"],
+        default="base",
+        help="Purpose for online datasets: base pretraining, instruction fine-tune, or conversation fine-tune.",
+    )
+    prepare_parser.add_argument(
+        "--conversation_datasets",
+        default="",
+        help="Comma-separated built-in online dataset IDs. TinyStories is for base; chat/instruction sets are for fine-tuning.",
+    )
+    prepare_parser.add_argument("--conversation_sample_limit", type=int, default=20000)
     prepare_parser.set_defaults(func=prepare)
 
     train_parser = subparsers.add_parser("train", help="Train a MicroGPT model")
@@ -225,6 +322,44 @@ def build_parser() -> argparse.ArgumentParser:
     export_hf_parser.add_argument("--model_dir", required=True)
     export_hf_parser.add_argument("--output_dir", default=None)
     export_hf_parser.set_defaults(func=export_hf)
+
+    coordinator_parser = subparsers.add_parser("coordinator-server", help="Run the distributed training coordinator API")
+    coordinator_parser.add_argument("--host", default="127.0.0.1")
+    coordinator_parser.add_argument("--port", type=int, default=8765)
+    coordinator_parser.add_argument("--artifact-root", default=None)
+    coordinator_parser.set_defaults(func=coordinator_server)
+
+    bundle_parser = subparsers.add_parser("create-job-bundle", help="Create a remote-worker dataset artifact bundle")
+    bundle_parser.add_argument("--dataset-dir", required=True)
+    bundle_parser.add_argument("--output-dir", required=True)
+    bundle_parser.add_argument("--artifact-root", default=None)
+    bundle_parser.add_argument("--base-url", default="/artifacts")
+    bundle_parser.add_argument("--epochs", type=int, default=5)
+    bundle_parser.add_argument("--batch-size", type=int, default=16)
+    bundle_parser.add_argument("--context-length", type=int, default=128)
+    bundle_parser.add_argument("--embedding-size", type=int, default=256)
+    bundle_parser.add_argument("--head-count", type=int, default=4)
+    bundle_parser.add_argument("--layer-count", type=int, default=4)
+    bundle_parser.add_argument("--dropout", type=float, default=0.1)
+    bundle_parser.add_argument("--learning-rate", type=float, default=3e-4)
+    bundle_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    bundle_parser.add_argument("--min-vram-gb", type=float, default=None)
+    bundle_parser.add_argument("--tags", default="gpu" if torch.cuda.is_available() else "cpu")
+    bundle_parser.set_defaults(func=create_job_bundle)
+
+    worker_parser = subparsers.add_parser("worker-client", help="Run a remote training worker client")
+    worker_parser.add_argument("--coordinator-url", default="http://127.0.0.1:8765")
+    worker_parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    worker_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    worker_parser.add_argument("--labels", default="gpu" if torch.cuda.is_available() else "cpu")
+    worker_parser.add_argument("--heartbeat-interval", type=int, default=10)
+    worker_parser.add_argument(
+        "--workspace-dir",
+        default=str(Path.home() / ".micro_llm_creator" / "worker_workspace"),
+    )
+    worker_parser.add_argument("--claim-once", action="store_true")
+    worker_parser.add_argument("--execute", action="store_true")
+    worker_parser.set_defaults(func=worker_client)
     return parser
 
 

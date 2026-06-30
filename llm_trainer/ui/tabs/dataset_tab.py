@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from llm_trainer.conversation_datasets import CONVERSATION_DATASET_PRESETS
+
 
 def build_dataset_tab(window) -> QWidget:
     """Build the dataset preparation page.
@@ -131,6 +133,51 @@ def build_dataset_tab(window) -> QWidget:
     )
     window.instruction_samples.toggled.connect(window.reasoning_sample_mode.setEnabled)
 
+    conversation_form = QFormLayout()
+    window._configure_form(conversation_form)
+    window.dataset_stage = QComboBox()
+    window.dataset_stage.addItems(["Base pretraining", "Instruction fine-tune", "Conversation fine-tune"])
+    window.dataset_stage.setMaximumWidth(260)
+    window._tip(
+        window.dataset_stage,
+        "Choose what this prepared dataset is for. Base datasets help language modeling; instruction/chat datasets belong to fine-tuning.",
+    )
+    window.include_conversation_datasets = QCheckBox("Include online training datasets")
+    window.include_conversation_datasets.setChecked(False)
+    window._tip(
+        window.include_conversation_datasets,
+        "Download/read selected Hugging Face datasets for the selected training purpose.",
+    )
+    conversation_form.addRow("Dataset purpose", window.dataset_stage)
+    conversation_form.addRow("", window.include_conversation_datasets)
+    window.conversation_datasets_status = QLabel("Base pretraining: choose optional online corpus datasets, or use local files only.")
+    window.conversation_datasets_status.setObjectName("Muted")
+    window._tip(
+        window.conversation_datasets_status,
+        "Turn on Include online conversation datasets to download/read the selected Hugging Face datasets.",
+    )
+    conversation_form.addRow("", window.conversation_datasets_status)
+    window.conversation_dataset_checks = {}
+    for dataset_id, preset in CONVERSATION_DATASET_PRESETS.items():
+        checkbox = QCheckBox(preset.label)
+        checkbox.setChecked(False)
+        checkbox.setEnabled(False)
+        window._tip(checkbox, preset.description)
+        window.conversation_dataset_checks[dataset_id] = checkbox
+        conversation_form.addRow("", checkbox)
+    window.conversation_sample_limit = window._spin(0, 2_000_000, 20000)
+    window._tip(
+        window.conversation_sample_limit,
+        "Maximum rows to read from each selected Hugging Face dataset. Use 0 only when you intentionally want the full dataset.",
+    )
+    window.conversation_sample_limit.setEnabled(False)
+    window.include_conversation_datasets.toggled.connect(window.conversation_sample_limit.setEnabled)
+    for checkbox in window.conversation_dataset_checks.values():
+        window.include_conversation_datasets.toggled.connect(checkbox.setEnabled)
+    window.include_conversation_datasets.toggled.connect(window._update_online_dataset_stage_controls)
+    window.dataset_stage.currentTextChanged.connect(window._update_online_dataset_stage_controls)
+    conversation_form.addRow("Rows per dataset", window.conversation_sample_limit)
+
     source_form.addRow("Source vault", window._path_row(window.input_dir, directory=True))
     source_form.addRow("Dataset core", window._path_row(window.dataset_dir, directory=True))
     source_form.addRow("Parallel lanes", window.max_workers)
@@ -158,8 +205,11 @@ def build_dataset_tab(window) -> QWidget:
     source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
     tokenizer_card = window._card("TOKENIZER CORE", tokenizer_form)
     tokenizer_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+    conversation_card = window._card("CONVERSATION DATA", conversation_form)
+    conversation_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
     left_column.addWidget(source_card, 0)
     right_column.addWidget(tokenizer_card, 0)
+    left_column.addWidget(conversation_card, 0)
 
     quality_grid = QGridLayout()
     quality_grid.setHorizontalSpacing(8)
@@ -241,4 +291,5 @@ def build_dataset_tab(window) -> QWidget:
 
     window.dataset_progress = window._thin_progress()
     outer.addWidget(window.dataset_progress)
+    window._update_online_dataset_stage_controls()
     return page
