@@ -211,6 +211,43 @@ def build_dataset_tab(window) -> QWidget:
     right_column.addWidget(tokenizer_card, 0)
     left_column.addWidget(conversation_card, 0)
 
+    mixture_form = QFormLayout()
+    window._configure_form(mixture_form)
+    window.mixture_local_prose = window._double_spin(0.0, 100.0, 50.0, 1.0, 1)
+    window.mixture_source_code = window._double_spin(0.0, 100.0, 30.0, 1.0, 1)
+    window.mixture_online_base = window._double_spin(0.0, 100.0, 20.0, 1.0, 1)
+    window.mixture_instruction = window._double_spin(0.0, 100.0, 0.0, 1.0, 1)
+    window.mixture_conversation = window._double_spin(0.0, 100.0, 0.0, 1.0, 1)
+    window.mixture_total_label = QLabel("Total: 100.0%")
+    window.mixture_total_label.setObjectName("Metric")
+    window.mixture_normalize_button = QPushButton("Normalize")
+    window.mixture_normalize_button.setMaximumWidth(140)
+    window._tip(window.mixture_local_prose, "Target share for local PDFs, text, and prose documents.")
+    window._tip(window.mixture_source_code, "Target share for source-code files and extracted code blocks.")
+    window._tip(window.mixture_online_base, "Target share for base pretraining datasets such as TinyStories, WikiText, Wikipedia, or FineWeb-Edu.")
+    window._tip(window.mixture_instruction, "Target share for instruction datasets such as Alpaca, Dolly, or SlimOrca.")
+    window._tip(window.mixture_conversation, "Target share for chat datasets such as UltraChat, DailyDialog, or OpenAssistant.")
+    window._tip(window.mixture_normalize_button, "Scale the mixture values so the total becomes 100 percent.")
+    for spin in (
+        window.mixture_local_prose,
+        window.mixture_source_code,
+        window.mixture_online_base,
+        window.mixture_instruction,
+        window.mixture_conversation,
+    ):
+        spin.valueChanged.connect(window._update_mixture_total)
+    window.mixture_normalize_button.clicked.connect(window._normalize_mixture_weights)
+    mixture_form.addRow("Local prose", window.mixture_local_prose)
+    mixture_form.addRow("Source code", window.mixture_source_code)
+    mixture_form.addRow("Online base", window.mixture_online_base)
+    mixture_form.addRow("Instruction", window.mixture_instruction)
+    mixture_form.addRow("Conversation", window.mixture_conversation)
+    mixture_form.addRow("Mix total", window.mixture_total_label)
+    mixture_form.addRow("", window.mixture_normalize_button)
+    mixture_card = window._card("DATASET MIXTURE", mixture_form)
+    mixture_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+    left_column.addWidget(mixture_card, 0)
+
     quality_grid = QGridLayout()
     quality_grid.setHorizontalSpacing(8)
     quality_grid.setVerticalSpacing(8)

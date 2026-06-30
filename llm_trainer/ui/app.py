@@ -1600,6 +1600,13 @@ class MainWindow(QMainWindow):
                 "dataset_stage": "base",
                 "conversation_datasets": [],
                 "conversation_sample_limit": 20000,
+                "mixture_weights": {
+                    "local_prose": 50.0,
+                    "source_code": 30.0,
+                    "online_base": 20.0,
+                    "instruction": 0.0,
+                    "conversation": 0.0,
+                },
                 "min_frequency": 2,
                 "context_length": 128,
                 "validation_split": 0.1,
@@ -1801,6 +1808,7 @@ class MainWindow(QMainWindow):
                 "dataset_stage": self._dataset_stage_value(),
                 "conversation_datasets": self._selected_conversation_datasets(),
                 "conversation_sample_limit": self.conversation_sample_limit.value(),
+                "mixture_weights": self._mixture_weights_from_ui(),
                 "min_frequency": self.min_frequency.value(),
                 "context_length": self.context_length.value(),
                 "validation_split": self.validation_split.value(),
@@ -1927,6 +1935,7 @@ class MainWindow(QMainWindow):
         self.include_conversation_datasets.setChecked(include_conversation)
         self._set_selected_conversation_datasets(list(dataset.get("conversation_datasets", [])))
         self.conversation_sample_limit.setValue(int(dataset.get("conversation_sample_limit", self.conversation_sample_limit.value())))
+        self._set_mixture_weights(dict(dataset.get("mixture_weights", {})))
         self.min_frequency.setValue(int(dataset.get("min_frequency", self.min_frequency.value())))
         self.context_length.setValue(int(dataset.get("context_length", self.context_length.value())))
         self.validation_split.setValue(float(dataset.get("validation_split", self.validation_split.value())))
@@ -2063,6 +2072,7 @@ class MainWindow(QMainWindow):
         self._update_tokenizer_strategy_controls()
         self._update_training_mode_controls()
         self._restore_artifact_status(data.get("artifacts", {}))
+        self.refresh_fine_tune_workflow()
 
     def _restore_artifact_status(self, artifacts: dict[str, Any]) -> None:
         """Refresh top-bar and button state from saved or existing artifacts.
@@ -2661,6 +2671,7 @@ class MainWindow(QMainWindow):
             vocab_size=None if self.auto_vocab.isChecked() else self.manual_vocab_size.value(),
             conversation_datasets=self._selected_conversation_datasets(),
             conversation_sample_limit=self.conversation_sample_limit.value(),
+            mixture_weights=self._mixture_weights_from_ui(),
             min_frequency=self.min_frequency.value(),
             context_length=self.context_length.value(),
             validation_split=self.validation_split.value(),
@@ -2919,6 +2930,23 @@ class MainWindow(QMainWindow):
         )
         if getattr(result, "dataset_version_id", ""):
             self.dataset_log.append(f"Dataset version: {result.dataset_version_id}")
+        mixture_report = getattr(result, "mixture_report", {}) or {}
+        if mixture_report:
+            self.dataset_log.append("Mixture report:")
+            for family in ("local_prose", "source_code", "online_base", "instruction", "conversation"):
+                row = mixture_report.get("families", {}).get(family, {})
+                if not row:
+                    continue
+                requested = float(row.get("requested_weight", 0.0) or 0.0)
+                selected = int(row.get("selected_documents", 0) or 0)
+                available = int(row.get("available_documents", 0) or 0)
+                dropped = int(row.get("dropped_documents", 0) or 0)
+                actual = float(row.get("actual_percent", 0.0) or 0.0)
+                if requested > 0.0 or selected > 0 or available > 0:
+                    self.dataset_log.append(
+                        f"- {row.get('label', family)}: requested {requested:.1f}%, "
+                        f"selected {selected:,}/{available:,}, dropped {dropped:,}, actual {actual:.1f}%"
+                    )
         if result.warning:
             self.dataset_log.append(f"Recommendation: {result.warning}")
         self._update_dataset_quality_report(
@@ -2935,6 +2963,7 @@ class MainWindow(QMainWindow):
                 "skipped_file_count": result.skipped_file_count,
                 "failed_file_count": result.failed_file_count,
                 "warning": result.warning,
+                "mixture_report": mixture_report,
             }
         )
         self.train_data_dir.setText(str(result.output_dir))
@@ -2945,6 +2974,7 @@ class MainWindow(QMainWindow):
                 f"Dataset: {result.code_sample_count:,} code, {result.prose_sample_count:,} prose, {result.token_count:,} tokens"
             )
         self.refresh_model_estimate()
+        self.refresh_fine_tune_workflow()
         self._clear_button_busy("DataSet Prepared")
 
     def _prepare_mode_value(self) -> str:
@@ -3074,6 +3104,75 @@ class MainWindow(QMainWindow):
             self.conversation_sample_limit.setEnabled(self.include_conversation_datasets.isChecked())
         if hasattr(self, "conversation_datasets_status"):
             self._update_online_dataset_stage_controls()
+
+    def _mixture_weights_from_ui(self) -> dict[str, float]:
+        """Return dataset mixture weights from the Ingest tab.
+
+        Returns:
+            Mapping from mixture source family to percentage.
+        """
+
+        if not hasattr(self, "mixture_local_prose"):
+            return {}
+        return {
+            "local_prose": float(self.mixture_local_prose.value()),
+            "source_code": float(self.mixture_source_code.value()),
+            "online_base": float(self.mixture_online_base.value()),
+            "instruction": float(self.mixture_instruction.value()),
+            "conversation": float(self.mixture_conversation.value()),
+        }
+
+    def _set_mixture_weights(self, weights: dict[str, Any]) -> None:
+        """Restore dataset mixture weights.
+
+        Args:
+            weights: Saved mixture weights by source family.
+        """
+
+        if not hasattr(self, "mixture_local_prose"):
+            return
+        defaults = {
+            "local_prose": 50.0,
+            "source_code": 30.0,
+            "online_base": 20.0,
+            "instruction": 0.0,
+            "conversation": 0.0,
+        }
+        values = {**defaults, **(weights or {})}
+        widgets = {
+            "local_prose": self.mixture_local_prose,
+            "source_code": self.mixture_source_code,
+            "online_base": self.mixture_online_base,
+            "instruction": self.mixture_instruction,
+            "conversation": self.mixture_conversation,
+        }
+        for key, widget in widgets.items():
+            try:
+                widget.setValue(float(values.get(key, defaults[key])))
+            except (TypeError, ValueError):
+                widget.setValue(defaults[key])
+        self._update_mixture_total()
+
+    def _update_mixture_total(self) -> None:
+        """Refresh the visible dataset mixture total."""
+
+        if not hasattr(self, "mixture_total_label"):
+            return
+        total = sum(self._mixture_weights_from_ui().values())
+        self.mixture_total_label.setText(f"Total: {total:.1f}%")
+        self.mixture_total_label.setProperty("state", "ok" if abs(total - 100.0) <= 0.1 else "warning")
+        self.mixture_total_label.style().unpolish(self.mixture_total_label)
+        self.mixture_total_label.style().polish(self.mixture_total_label)
+
+    def _normalize_mixture_weights(self) -> None:
+        """Scale dataset mixture values so they total 100 percent."""
+
+        weights = self._mixture_weights_from_ui()
+        total = sum(weights.values())
+        if total <= 0:
+            self._set_mixture_weights({"local_prose": 100.0})
+            return
+        self._set_mixture_weights({key: value * 100.0 / total for key, value in weights.items()})
 
     def _training_launch_target_value(self) -> str:
         """Return whether training should launch locally or remotely.
@@ -3212,6 +3311,97 @@ class MainWindow(QMainWindow):
         self.lora_alpha.setEnabled(lora_enabled)
         self.lora_dropout.setEnabled(lora_enabled)
         self.lora_targets.setEnabled(lora_enabled)
+        self.refresh_fine_tune_workflow()
+
+    def _current_dataset_summary(self) -> dict[str, Any]:
+        """Read the active prepared dataset summary.
+
+        Returns:
+            Dataset summary dictionary, or an empty dictionary.
+        """
+
+        summary_path = Path(self.train_data_dir.text()) / "dataset_summary.json"
+        if not summary_path.exists():
+            summary_path = Path(self.dataset_dir.text()) / "dataset_summary.json"
+        if not summary_path.exists():
+            return {}
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            LOGGER.warning("Could not read dataset summary %s: %s", summary_path, exc)
+            return {}
+
+    def _fine_tune_dataset_stage_status(self) -> tuple[bool, str]:
+        """Check whether the prepared dataset matches the fine-tune type.
+
+        Returns:
+            Tuple containing whether the workflow may proceed and a user-facing message.
+        """
+
+        expected_stage = self._training_stage_value()
+        summary = self._current_dataset_summary()
+        if not summary:
+            return False, "Dataset: not prepared. Prepare the fine-tune dataset first."
+        dataset_stage = str(summary.get("dataset_stage") or self._dataset_stage_value())
+        tokens = int(summary.get("token_count", 0) or 0)
+        vocab = int(summary.get("tokenizer_vocab_size", 0) or 0)
+        stage_name = dataset_stage_label(dataset_stage) if dataset_stage in {"base", "instruction", "conversation"} else dataset_stage
+        details = f"{stage_name}, {tokens:,} tokens, vocab {vocab:,}"
+        if expected_stage == "instruction" and dataset_stage != "instruction":
+            return False, f"Dataset mismatch: selected Instruction fine-tune, but prepared dataset is {details}."
+        if expected_stage == "conversation" and dataset_stage != "conversation":
+            return False, f"Dataset mismatch: selected Conversation fine-tune, but prepared dataset is {details}."
+        if expected_stage == "domain" and dataset_stage == "base":
+            return True, f"Dataset warning: {details}. Base datasets usually belong to pretraining; continue only for domain adaptation."
+        return True, f"Dataset ready: {details}."
+
+    def refresh_fine_tune_workflow(self) -> None:
+        """Refresh fine-tune workflow guidance in the Fine-Tuning tab."""
+
+        if not hasattr(self, "fine_tune_dataset_status"):
+            return
+        ok, message = self._fine_tune_dataset_stage_status()
+        self.fine_tune_dataset_status.setText(message)
+        self.fine_tune_dataset_status.setProperty("state", "ok" if ok else "warning")
+        self.fine_tune_dataset_status.style().unpolish(self.fine_tune_dataset_status)
+        self.fine_tune_dataset_status.style().polish(self.fine_tune_dataset_status)
+
+    def apply_recommended_fine_tune_settings(self) -> None:
+        """Apply conservative fine-tuning defaults for the selected workflow."""
+
+        stage = self._training_stage_value()
+        self._set_combo_text(self.peft_method, "LoRA adapters")
+        self.lora_dropout.setValue(0.05)
+        self._set_combo_text(self.lora_targets, "Attention projections")
+        self.max_grad_norm.setValue(0.5)
+        self.weight_decay.setValue(0.05)
+        self._set_combo_by_data(self.scheduler_name, "cosine", {
+            "warmup_linear": "Warmup linear",
+            "cosine": "Cosine decay",
+            "polynomial": "Polynomial decay",
+            "one_cycle": "One-cycle",
+            "constant": "Constant",
+        })
+        if stage == "conversation":
+            self.lora_rank.setValue(16)
+            self.lora_alpha.setValue(32.0)
+            self.learning_rate.setValue(0.00003)
+            self.epochs.setValue(max(1, min(self.epochs.value(), 2)))
+        elif stage == "instruction":
+            self.lora_rank.setValue(8)
+            self.lora_alpha.setValue(16.0)
+            self.learning_rate.setValue(0.00005)
+            self.epochs.setValue(max(1, min(self.epochs.value(), 3)))
+        else:
+            self.lora_rank.setValue(8)
+            self.lora_alpha.setValue(16.0)
+            self.learning_rate.setValue(0.00005)
+        self._update_training_mode_controls()
+        self.fine_tune_preview.setText(
+            "Recommended LoRA settings applied.\n"
+            "Use Check Fine-tune before starting so checkpoint and tokenizer compatibility are verified."
+        )
 
     def _attention_type_value(self) -> str:
         """Return the selected attention layout identifier.
@@ -3480,6 +3670,10 @@ class MainWindow(QMainWindow):
     def preview_fine_tune_compatibility(self) -> None:
         """Preview whether the selected checkpoint can be used for fine-tuning."""
 
+        stage_ok, stage_message = self._fine_tune_dataset_stage_status()
+        if not stage_ok:
+            self.fine_tune_preview.setText(f"[BLOCK] {stage_message}")
+            return
         base_path = Path(self.fine_tune_checkpoint.text()) if self.fine_tune_checkpoint.text().strip() else None
         if base_path is None:
             self.fine_tune_preview.setText("[BLOCK] Choose a base checkpoint for fine-tuning.")
@@ -3501,6 +3695,7 @@ class MainWindow(QMainWindow):
                 lines.append("[BLOCK] Base checkpoint cannot be fine-tuned with the current model/dataset settings.")
             else:
                 lines.append("[OK] Base checkpoint weights can be used for fine-tuning.")
+            lines.append(f"[OK] {stage_message}" if stage_ok else f"[BLOCK] {stage_message}")
             lines.extend(f"[OK] {line}" for line in report.info)
             behavior_warnings = [
                 warning for warning in report.warnings
@@ -3876,6 +4071,12 @@ class MainWindow(QMainWindow):
         self.active_training_log = self.fine_tune_log
         self.active_training_progress = self.fine_tune_progress
         self.active_training_final_button_text = "Start Fine-Tune"
+        stage_ok, stage_message = self._fine_tune_dataset_stage_status()
+        self.refresh_fine_tune_workflow()
+        if not stage_ok:
+            self.fine_tune_log.append(stage_message)
+            QMessageBox.warning(self, "Fine-tune blocked", stage_message)
+            return
         resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
         dataset_dir = Path(self.train_data_dir.text())
         vocab_size = self._current_training_vocab_size(dataset_dir)

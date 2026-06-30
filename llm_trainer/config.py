@@ -33,6 +33,7 @@ class DatasetConfig:
         dataset_stage: Intended dataset purpose: base, instruction, or conversation.
         conversation_datasets: Built-in Hugging Face conversation dataset IDs to include.
         conversation_sample_limit: Maximum rows to read from each selected conversation dataset. Zero means no limit.
+        mixture_weights: Planned dataset mixture percentages by source family.
     """
 
     input_dir: Path
@@ -56,6 +57,7 @@ class DatasetConfig:
     dataset_stage: str = "base"
     conversation_datasets: list[str] = field(default_factory=list)
     conversation_sample_limit: int = 20000
+    mixture_weights: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

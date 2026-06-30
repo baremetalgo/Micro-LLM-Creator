@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
@@ -55,6 +56,7 @@ def build_fine_tuning_tab(window) -> QWidget:
     window.training_mode.addItems(["Instruction fine-tune", "Conversation fine-tune", "Fine-tune checkpoint"])
     window.training_mode.setMaximumWidth(300)
     window.training_mode.currentTextChanged.connect(window._update_training_mode_controls)
+    window.training_mode.currentTextChanged.connect(window.refresh_fine_tune_workflow)
     window._tip(
         window.training_mode,
         "Instruction tunes request-following, conversation tunes chat behavior, generic fine-tune adapts domain data.",
@@ -80,6 +82,20 @@ def build_fine_tuning_tab(window) -> QWidget:
     window.fine_tune_check_button.setMaximumWidth(180)
     window.fine_tune_check_button.clicked.connect(window.preview_fine_tune_compatibility)
     window._tip(window.fine_tune_check_button, "Inspect whether the base checkpoint can be used for fine-tuning.")
+    window.fine_tune_dataset_status = QLabel("Dataset: not checked")
+    window.fine_tune_dataset_status.setObjectName("Metric")
+    window._tip(
+        window.fine_tune_dataset_status,
+        "Shows whether the prepared dataset purpose matches this fine-tune workflow.",
+    )
+    window.fine_tune_refresh_button = QPushButton("Refresh Dataset Fit")
+    window.fine_tune_refresh_button.setMaximumWidth(190)
+    window.fine_tune_refresh_button.clicked.connect(window.refresh_fine_tune_workflow)
+    window._tip(window.fine_tune_refresh_button, "Re-read dataset_summary.json and check whether this dataset fits the fine-tune type.")
+    window.apply_lora_preset_button = QPushButton("Apply Recommended LoRA")
+    window.apply_lora_preset_button.setMaximumWidth(220)
+    window.apply_lora_preset_button.clicked.connect(window.apply_recommended_fine_tune_settings)
+    window._tip(window.apply_lora_preset_button, "Apply conservative LoRA, learning-rate, and clipping defaults for the selected fine-tune type.")
 
     mode_form.addRow("Fine-tune type", window.training_mode)
     mode_form.addRow("Base model", window._path_row(window.fine_tune_checkpoint, directory=False))
@@ -88,6 +104,9 @@ def build_fine_tuning_tab(window) -> QWidget:
     mode_form.addRow("LoRA alpha", window.lora_alpha)
     mode_form.addRow("LoRA dropout", window.lora_dropout)
     mode_form.addRow("LoRA target", window.lora_targets)
+    mode_form.addRow("Dataset fit", window.fine_tune_dataset_status)
+    mode_form.addRow("", window.fine_tune_refresh_button)
+    mode_form.addRow("", window.apply_lora_preset_button)
     mode_form.addRow("", window.fine_tune_check_button)
     left_zone.addWidget(window._card("ADAPTATION CONTROL", mode_form), 0)
 

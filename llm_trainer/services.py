@@ -16,6 +16,7 @@ import PyPDF2
 from .config import DatasetConfig, ModelConfig, TrainingConfig, dataclass_to_jsonable
 from .conversation_datasets import CONVERSATION_DATASET_PRESETS, dataset_ids_for_stage, load_conversation_documents
 from .data import (
+    Document,
     SUPPORTED_CODE_SUFFIXES,
     SUPPORTED_TEXT_SUFFIXES,
     document_from_dict,
@@ -56,6 +57,7 @@ class DatasetBuildResult:
         failed_file_count: Number of files that failed extraction.
         dataset_version_id: Unique dataset version identifier.
         dataset_version_number: One-based dataset version number.
+        mixture_report: Per-source family sampling report.
     """
 
     output_dir: Path
@@ -75,6 +77,7 @@ class DatasetBuildResult:
     failed_file_count: int = 0
     dataset_version_id: str = ""
     dataset_version_number: int = 0
+    mixture_report: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1140,6 +1143,218 @@ def _load_documents_with_cache(
     )
 
 
+MIXTURE_LABELS = {
+    "local_prose": "Local prose",
+    "source_code": "Source code",
+    "online_base": "Online base",
+    "instruction": "Instruction",
+    "conversation": "Conversation",
+}
+
+
+def _document_mixture_family(document: Document) -> str:
+    """Classify a document into a dataset mixture source family.
+
+    Args:
+        document: Loaded source document.
+
+    Returns:
+        Mixture source family identifier.
+    """
+
+    if document.kind == "code":
+        return "source_code"
+    if document.kind == "instruction":
+        return "instruction"
+    if document.kind == "conversation":
+        return "conversation"
+    dataset_id = str(document.language or "")
+    preset = CONVERSATION_DATASET_PRESETS.get(dataset_id)
+    if preset and preset.stage == "base":
+        return "online_base"
+    if "__hf_datasets__" in document.path.parts:
+        for part in document.path.parts:
+            preset = CONVERSATION_DATASET_PRESETS.get(part)
+            if preset and preset.stage == "base":
+                return "online_base"
+    return "local_prose"
+
+
+def _stable_document_sort_key(document: Document) -> str:
+    """Return a stable pseudo-random sort key for sampling.
+
+    Args:
+        document: Loaded source document.
+
+    Returns:
+        Hex digest used to order documents deterministically.
+    """
+
+    key = f"{document.path}|{document.kind}|{document.language or ''}|{len(document.text)}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _empty_mixture_report(weights: dict[str, float], documents: list[Document], applied: bool, reason: str = "") -> dict[str, Any]:
+    """Build a mixture report without changing document selection.
+
+    Args:
+        weights: Requested mixture weights.
+        documents: Available documents.
+        applied: Whether weighted sampling was applied.
+        reason: Optional reason when sampling was not applied.
+
+    Returns:
+        Mixture report dictionary.
+    """
+
+    by_family: dict[str, list[Document]] = {key: [] for key in MIXTURE_LABELS}
+    for document in documents:
+        by_family.setdefault(_document_mixture_family(document), []).append(document)
+    total_chars = sum(len(document.text) for document in documents)
+    families = {}
+    for family, label in MIXTURE_LABELS.items():
+        available = by_family.get(family, [])
+        available_chars = sum(len(document.text) for document in available)
+        families[family] = {
+            "label": label,
+            "requested_weight": float(weights.get(family, 0.0) or 0.0),
+            "available_documents": len(available),
+            "available_characters": available_chars,
+            "selected_documents": len(available) if not applied else 0,
+            "selected_characters": available_chars if not applied else 0,
+            "actual_percent": (available_chars * 100.0 / total_chars) if total_chars else 0.0,
+            "dropped_documents": 0,
+            "dropped_characters": 0,
+        }
+    return {
+        "applied": applied,
+        "reason": reason,
+        "total_available_documents": len(documents),
+        "total_selected_documents": len(documents) if not applied else 0,
+        "total_available_characters": total_chars,
+        "total_selected_characters": total_chars if not applied else 0,
+        "families": families,
+    }
+
+
+def _apply_dataset_mixture(
+    documents: list[Document],
+    weights: dict[str, float],
+    progress: Optional[Callable[[Any], None]],
+) -> tuple[list[Document], dict[str, Any]]:
+    """Apply weighted sampling by source family.
+
+    Args:
+        documents: Loaded documents before mixture sampling.
+        weights: Requested mixture percentages.
+        progress: Optional progress callback.
+
+    Returns:
+        Selected documents and mixture report.
+    """
+
+    clean_weights: dict[str, float] = {}
+    for family in MIXTURE_LABELS:
+        try:
+            clean_weights[family] = max(0.0, float(weights.get(family, 0.0) or 0.0))
+        except (TypeError, ValueError):
+            clean_weights[family] = 0.0
+    requested_total = sum(clean_weights.values())
+    if requested_total <= 0.0:
+        return documents, _empty_mixture_report(clean_weights, documents, applied=False, reason="No positive mixture weights.")
+
+    grouped: dict[str, list[Document]] = {key: [] for key in MIXTURE_LABELS}
+    for document in documents:
+        grouped.setdefault(_document_mixture_family(document), []).append(document)
+    available_families = {
+        family: items
+        for family, items in grouped.items()
+        if items and clean_weights.get(family, 0.0) > 0.0
+    }
+    if not available_families:
+        return documents, _empty_mixture_report(
+            clean_weights,
+            documents,
+            applied=False,
+            reason="No documents matched positive mixture weights.",
+        )
+
+    total_available_chars = sum(len(document.text) for document in documents)
+    total_budget = total_available_chars
+    active_weight_total = sum(clean_weights[family] for family in available_families)
+    sorted_groups = {
+        family: sorted(items, key=_stable_document_sort_key)
+        for family, items in available_families.items()
+    }
+    selected_by_family: dict[str, list[Document]] = {family: [] for family in MIXTURE_LABELS}
+    selected_ids: set[int] = set()
+    remaining_budget = 0
+
+    for family, items in sorted_groups.items():
+        target_chars = int(total_budget * clean_weights[family] / active_weight_total)
+        selected_chars = 0
+        for document in items:
+            if selected_chars >= target_chars and selected_by_family[family]:
+                break
+            selected_by_family[family].append(document)
+            selected_ids.add(id(document))
+            selected_chars += len(document.text)
+        remaining_budget += max(0, target_chars - selected_chars)
+
+    if remaining_budget > 0:
+        weighted_families = sorted(sorted_groups, key=lambda family: clean_weights[family], reverse=True)
+        for family in weighted_families:
+            for document in sorted_groups[family]:
+                if remaining_budget <= 0:
+                    break
+                if id(document) in selected_ids:
+                    continue
+                selected_by_family[family].append(document)
+                selected_ids.add(id(document))
+                remaining_budget -= len(document.text)
+
+    selected_documents = [
+        document
+        for family in MIXTURE_LABELS
+        for document in selected_by_family.get(family, [])
+    ]
+    selected_documents = sorted(selected_documents, key=lambda document: (str(document.path), document.kind, document.language or ""))
+    selected_total_chars = sum(len(document.text) for document in selected_documents)
+    report = {
+        "applied": True,
+        "reason": "",
+        "total_available_documents": len(documents),
+        "total_selected_documents": len(selected_documents),
+        "total_available_characters": total_available_chars,
+        "total_selected_characters": selected_total_chars,
+        "families": {},
+    }
+    for family, label in MIXTURE_LABELS.items():
+        available = grouped.get(family, [])
+        selected = selected_by_family.get(family, [])
+        available_chars = sum(len(document.text) for document in available)
+        selected_chars = sum(len(document.text) for document in selected)
+        report["families"][family] = {
+            "label": label,
+            "requested_weight": clean_weights.get(family, 0.0),
+            "available_documents": len(available),
+            "available_characters": available_chars,
+            "selected_documents": len(selected),
+            "selected_characters": selected_chars,
+            "actual_percent": (selected_chars * 100.0 / selected_total_chars) if selected_total_chars else 0.0,
+            "dropped_documents": max(0, len(available) - len(selected)),
+            "dropped_characters": max(0, available_chars - selected_chars),
+        }
+    if len(selected_documents) != len(documents):
+        _emit(
+            progress,
+            f"Weighted sampler selected {len(selected_documents):,}/{len(documents):,} samples "
+            f"({selected_total_chars:,}/{total_available_chars:,} characters).",
+            49,
+        )
+    return selected_documents or documents, report
+
+
 def build_dataset(
     config: DatasetConfig,
     progress: Optional[Callable[[Any], None]] = None,
@@ -1173,6 +1388,11 @@ def build_dataset(
         raise RuntimeError("Dataset preparation stopped by user.")
     if not documents:
         raise ValueError("No supported text, PDF, or JSONL documents were found.")
+    documents, mixture_report = _apply_dataset_mixture(documents, config.mixture_weights, progress)
+    if should_stop and should_stop():
+        raise RuntimeError("Dataset preparation stopped by user.")
+    if not documents:
+        raise ValueError("Dataset mixture selected no documents. Adjust mixture weights and try again.")
 
     all_text = "\n".join(doc.text for doc in documents)
     character_count = len(all_text)
@@ -1192,6 +1412,32 @@ def build_dataset(
         _emit(progress, f"Cache: reused {cached_file_count:,} file(s), processed {processed_file_count:,} file(s).", 47)
     if skipped_file_count or failed_file_count:
         _emit(progress, f"Quality: skipped {skipped_file_count:,} empty file(s), failed {failed_file_count:,} file(s).", 48)
+    if config.mixture_weights:
+        mixture_parts = []
+        for key, value in config.mixture_weights.items():
+            try:
+                numeric_value = float(value or 0.0)
+            except (TypeError, ValueError):
+                numeric_value = 0.0
+            if numeric_value > 0.0:
+                mixture_parts.append(f"{key.replace('_', ' ')} {numeric_value:.1f}%")
+        mixture_text = ", ".join(mixture_parts)
+        if mixture_text:
+            _emit(progress, f"Dataset mixture plan: {mixture_text}.", 49)
+    if mixture_report.get("applied"):
+        for family in MIXTURE_LABELS:
+            row = mixture_report.get("families", {}).get(family, {})
+            if int(row.get("selected_documents", 0) or 0) > 0 or float(row.get("requested_weight", 0.0) or 0.0) > 0.0:
+                _emit(
+                    progress,
+                    (
+                        f"Mixture {row.get('label', family)}: requested {float(row.get('requested_weight', 0.0) or 0.0):.1f}%, "
+                        f"selected {int(row.get('selected_documents', 0) or 0):,}/"
+                        f"{int(row.get('available_documents', 0) or 0):,} sample(s), "
+                        f"actual {float(row.get('actual_percent', 0.0) or 0.0):.1f}%."
+                    ),
+                    49,
+                )
     _emit(progress, f"Unique word estimate: {unique_words:,}.", 48)
     _emit(progress, f"Auto vocabulary size: {selected_vocab_size:,}.", 50)
     if warning:
@@ -1245,6 +1491,8 @@ def build_dataset(
         "dataset_stage": config.dataset_stage,
         "conversation_datasets": config.conversation_datasets,
         "conversation_sample_limit": config.conversation_sample_limit,
+        "mixture_weights": config.mixture_weights,
+        "mixture_report": mixture_report,
         "suggested_vocab_size": suggested_vocab_size,
         "tokenizer_vocab_size": tokenizer.get_vocab_size(),
         "tokenizer_sha256": file_sha256(tokenizer_path),
@@ -1285,6 +1533,7 @@ def build_dataset(
         failed_file_count,
         str(dataset_version["version_id"]),
         int(dataset_version["version_number"]),
+        mixture_report,
     )
 
 
