@@ -68,6 +68,10 @@ class ModelConfig:
         position_encoding: Position encoding type: learned or rope.
         mlp_type: Feed-forward type: gelu or swiglu.
         rope_theta: RoPE frequency base when position_encoding is rope.
+        attention_type: Attention layout: mha, gqa, or mqa.
+        kv_head_count: Key/value head count for grouped-query attention.
+        attention_backend: Attention kernel backend: manual or sdpa.
+        attention_window: Sliding-window attention size. Zero means full context.
     """
 
     vocab_size: int
@@ -81,6 +85,10 @@ class ModelConfig:
     position_encoding: str = "learned"
     mlp_type: str = "gelu"
     rope_theta: float = 10000.0
+    attention_type: str = "mha"
+    kv_head_count: int = 0
+    attention_backend: str = "sdpa"
+    attention_window: int = 0
 
     def validate(self) -> None:
         """Validate architecture constraints.
@@ -105,6 +113,30 @@ class ModelConfig:
             head_size = self.embedding_size // self.head_count
             if head_size % 2 != 0:
                 raise ValueError("RoPE requires an even attention head size")
+        if self.attention_type not in {"mha", "gqa", "mqa"}:
+            raise ValueError("attention_type must be mha, gqa, or mqa")
+        if self.attention_backend not in {"manual", "sdpa"}:
+            raise ValueError("attention_backend must be manual or sdpa")
+        kv_heads = self.resolved_kv_head_count()
+        if kv_heads < 1 or kv_heads > self.head_count:
+            raise ValueError("kv_head_count must be between 1 and head_count")
+        if self.head_count % kv_heads != 0:
+            raise ValueError("head_count must be divisible by kv_head_count")
+        if self.attention_window < 0:
+            raise ValueError("attention_window cannot be negative")
+
+    def resolved_kv_head_count(self) -> int:
+        """Return the effective key/value head count.
+
+        Returns:
+            Key/value head count after applying the attention type.
+        """
+
+        if self.attention_type == "mqa":
+            return 1
+        if self.attention_type == "gqa":
+            return self.kv_head_count if self.kv_head_count > 0 else max(1, self.head_count // 2)
+        return self.head_count
 
 
 @dataclass
@@ -115,14 +147,21 @@ class TrainingConfig:
         output_dir: Folder where checkpoints and summaries are saved.
         epochs: Number of full passes over the training dataset.
         batch_size: Number of token windows per training batch.
-        learning_rate: AdamW learning rate.
-        weight_decay: AdamW weight decay regularization.
+        learning_rate: Base optimizer learning rate.
+        weight_decay: Optimizer weight decay regularization.
+        optimizer_name: Optimizer family: adamw, adam, lion, or adafactor.
+        scheduler_name: Learning-rate schedule: warmup_linear, cosine, polynomial, one_cycle, or constant.
+        scheduler_min_lr_ratio: Minimum learning-rate multiplier after decay.
+        polynomial_power: Power used by polynomial decay.
         gradient_accumulation: Batches to accumulate before optimizer step.
         warmup_steps: Steps used to ramp up learning rate.
         eval_interval: Steps between validation loss checks.
+        max_eval_batches: Maximum validation batches per interval evaluation. Zero evaluates all validation batches.
         save_interval: Steps between checkpoint writes.
+        data_loader_workers: CPU worker processes used to prepare token batches.
         max_grad_norm: Gradient clipping norm.
         use_amp: Enables mixed precision on CUDA.
+        precision: Numeric precision policy: fp32, fp16, or bf16.
         device: Training device, usually "cuda" or "cpu".
         seed: Random seed for repeatability.
         resume: Whether to resume from checkpoints.
@@ -135,17 +174,42 @@ class TrainingConfig:
     batch_size: int = 16
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
+    optimizer_name: str = "adamw"
+    scheduler_name: str = "warmup_linear"
+    scheduler_min_lr_ratio: float = 0.1
+    polynomial_power: float = 1.0
     gradient_accumulation: int = 1
     warmup_steps: int = 100
     eval_interval: int = 100
+    max_eval_batches: int = 50
     save_interval: int = 500
+    data_loader_workers: int = 0
     max_grad_norm: float = 1.0
     use_amp: bool = True
+    precision: str = "fp16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 1337
     resume: bool = True
     resume_from_checkpoint: Optional[Path] = None
     require_compatible_resume: bool = True
+
+    def validate(self) -> None:
+        """Validate optimizer and schedule settings.
+
+        Raises:
+            ValueError: If any optimization setting is unsupported.
+        """
+
+        if self.optimizer_name not in {"adamw", "adam", "lion", "adafactor"}:
+            raise ValueError("optimizer_name must be adamw, adam, lion, or adafactor")
+        if self.scheduler_name not in {"warmup_linear", "cosine", "polynomial", "one_cycle", "constant"}:
+            raise ValueError("scheduler_name must be warmup_linear, cosine, polynomial, one_cycle, or constant")
+        if self.precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("precision must be fp32, fp16, or bf16")
+        if self.scheduler_min_lr_ratio < 0.0 or self.scheduler_min_lr_ratio > 1.0:
+            raise ValueError("scheduler_min_lr_ratio must be between 0 and 1")
+        if self.polynomial_power <= 0.0:
+            raise ValueError("polynomial_power must be greater than 0")
 
 
 def dataclass_to_jsonable(value: Any) -> dict[str, Any]:

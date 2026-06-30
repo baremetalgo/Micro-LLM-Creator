@@ -81,6 +81,16 @@ QLabel#MetricChip {
     font-weight: 800;
 }
 
+QLabel#TrainingSampleLine {
+    color: #d8eec2;
+    background: #171a14;
+    border: 1px solid #6f8f45;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-family: Arial;
+    font-size: 12px;
+}
+
 QLabel#MessageMeta {
     color: #b6d77a;
     font-size: 11px;
@@ -241,4 +251,17 @@ QProgressBar {
 QProgressBar::chunk {
     background: #f5b041;
     border-radius: 2px;
+}
+
+QProgressBar#HardwareMeter {
+    background: #1a1a1a;
+    border: 0;
+    border-radius: 4px;
+    min-height: 8px;
+    max-height: 8px;
+}
+
+QProgressBar#HardwareMeter::chunk {
+    background: #f5b041;
+    border-radius: 4px;
 }

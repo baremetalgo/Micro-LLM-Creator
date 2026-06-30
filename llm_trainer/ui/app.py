@@ -6,19 +6,19 @@ import json
 import os
 from queue import Empty, Queue
 import re
+import shutil
 import signal
+import sqlite3
 import sys
 from pathlib import Path
 from threading import Event
 from typing import Any, Optional, Union
-from urllib.parse import quote
 
 import torch
-from PySide6.QtCore import QObject, QPoint, QPointF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QSpinBox,
@@ -45,219 +44,28 @@ from llm_trainer.config import DatasetConfig, ModelConfig, TrainingConfig
 from llm_trainer.evaluation import DEFAULT_BENCHMARK_PROMPTS, evaluate_checkpoint, normalize_prompts
 from llm_trainer.export import export_gguf_with_llama_cpp, export_hf_microgpt_package, export_project_bundle, quantize_checkpoint
 from llm_trainer.llama_chat import LlamaChatSession, load_llama_chat_session, stream_chat_reply
-from llm_trainer.services import build_dataset, train_from_dataset
-from llm_trainer.ui.chat_widgets import ChatInputEdit, ChatMessageWidget
+from llm_trainer.services import build_dataset, check_project_health, scan_dataset_preview
+from llm_trainer.telemetry_store import initialize_store, insert_metric, latest_run, rows_until, telemetry_db_path
+from llm_trainer.training_planning import estimate_training_resources, format_bytes
+from llm_trainer.training_service import run_training_job
+from llm_trainer.ui.chat_widgets import ChatMessageWidget
+from llm_trainer.ui.markdown_renderer import markdown_to_html
+from llm_trainer.ui.workers import TaskWorker
+from llm_trainer.ui.tabs.benchmark_tab import build_benchmark_tab
+from llm_trainer.ui.tabs.chat_tab import build_chat_tab
+from llm_trainer.ui.tabs.dataset_tab import build_dataset_tab
+from llm_trainer.ui.tabs.live_tab import build_live_training_tab
+from llm_trainer.ui.tabs.training_tab import build_training_tab
+from llm_trainer.ui.tabs.export_tab import build_export_tab
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 WINDOWS_APP_ID = "MicroLLMCreator.Lightning"
 
-
-class TaskWorker(QObject):
-    """Background worker used for long-running UI tasks."""
-
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        fn: Any,
-        *args: Any,
-        progress_queue: Optional[Queue] = None,
-        with_progress: bool = False,
-        stop_event: Optional[Event] = None,
-    ) -> None:
-        """Create a worker.
-
-        Args:
-            fn: Callable to execute in the worker thread.
-            *args: Positional arguments passed to ``fn``.
-            progress_queue: Optional queue for progress events.
-            with_progress: Whether to pass a progress callback to ``fn``.
-            stop_event: Optional event used for cooperative cancellation.
-        """
-
-        super().__init__()
-        self.fn = fn
-        self.args = args
-        self.progress_queue = progress_queue
-        self.with_progress = with_progress
-        self.stop_event = stop_event
-
-    def run(self) -> None:
-        """Execute the worker function and emit completion or failure."""
-
-        try:
-            if self.with_progress:
-                self.finished.emit(self.fn(*self.args, progress=self._queue_progress, should_stop=self._should_stop))
-            else:
-                self.finished.emit(self.fn(*self.args))
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-    def _queue_progress(self, event: Any) -> None:
-        if self.progress_queue is not None:
-            self.progress_queue.put(event)
-
-    def _should_stop(self) -> bool:
-        """Return whether the active task has been asked to stop.
-
-        Returns:
-            True when the cooperative stop event is set.
-        """
-
-        return bool(self.stop_event and self.stop_event.is_set())
-
-
-class LossChartWidget(QWidget):
-    """Compact live chart for one or two training metric series."""
-
-    def __init__(
-        self,
-        primary_label: str = "Train",
-        secondary_label: str = "Val",
-        empty_text: str = "Loss chart will appear during training",
-    ) -> None:
-        """Create an empty chart widget.
-
-        Args:
-            primary_label: Label for the primary series.
-            secondary_label: Label for the secondary series.
-            empty_text: Text shown before samples arrive.
-        """
-
-        super().__init__()
-        self.setObjectName("LossChart")
-        self.setMinimumHeight(130)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.primary_label = primary_label
-        self.secondary_label = secondary_label
-        self.empty_text = empty_text
-        self.train_points: list[tuple[int, float]] = []
-        self.val_points: list[tuple[int, float]] = []
-
-    def clear(self) -> None:
-        """Remove all plotted loss values."""
-
-        self.train_points.clear()
-        self.val_points.clear()
-        self.update()
-
-    def add_metrics(self, step: int, train_loss: Optional[float], val_loss: Optional[float]) -> None:
-        """Add a training metric sample.
-
-        Args:
-            step: Optimizer step for the sample.
-            train_loss: Optional training loss value.
-            val_loss: Optional validation loss value.
-        """
-
-        if train_loss is not None:
-            self.train_points.append((step, float(train_loss)))
-        if val_loss is not None:
-            self.val_points.append((step, float(val_loss)))
-        self.train_points = self.train_points[-400:]
-        self.val_points = self.val_points[-400:]
-        self.update()
-
-    def add_values(self, step: int, primary_value: Optional[float], secondary_value: Optional[float] = None) -> None:
-        """Add a generic metric sample.
-
-        Args:
-            step: Optimizer step for the sample.
-            primary_value: Primary series value.
-            secondary_value: Optional secondary series value.
-        """
-
-        self.add_metrics(step, primary_value, secondary_value)
-
-    def paintEvent(self, event: Any) -> None:
-        """Render the chart.
-
-        Args:
-            event: Qt paint event.
-        """
-
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(12, 10, -12, -18)
-        painter.fillRect(self.rect(), QColor("#141414"))
-        painter.setPen(QPen(QColor("#3d3d3d"), 1))
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 8, 8)
-
-        all_points = self.train_points + self.val_points
-        if not all_points:
-            painter.setPen(QColor("#8d8d8d"))
-            painter.drawText(rect, Qt.AlignCenter, self.empty_text)
-            painter.end()
-            return
-
-        min_step = min(step for step, _ in all_points)
-        max_step = max(step for step, _ in all_points)
-        min_loss = min(loss for _, loss in all_points)
-        max_loss = max(loss for _, loss in all_points)
-        if max_step == min_step:
-            max_step += 1
-        if max_loss == min_loss:
-            max_loss += 1.0
-        loss_padding = (max_loss - min_loss) * 0.08
-        min_loss = max(0.0, min_loss - loss_padding)
-        max_loss += loss_padding
-
-        painter.setPen(QPen(QColor("#333333"), 1))
-        for index in range(1, 4):
-            y = rect.top() + int(rect.height() * index / 4)
-            painter.drawLine(rect.left(), y, rect.right(), y)
-
-        self._draw_series(painter, rect, self.train_points, min_step, max_step, min_loss, max_loss, QColor("#f5b041"))
-        self._draw_series(painter, rect, self.val_points, min_step, max_step, min_loss, max_loss, QColor("#b6d77a"))
-        painter.setPen(QColor("#f5b041"))
-        painter.drawText(rect.left(), self.height() - 6, self.primary_label)
-        painter.setPen(QColor("#b6d77a"))
-        painter.drawText(rect.left() + 82, self.height() - 6, self.secondary_label)
-        painter.setPen(QColor("#cfcfcf"))
-        painter.drawText(rect.right() - 120, self.height() - 6, f"{min_loss:.3f} - {max_loss:.3f}")
-        painter.end()
-
-    def _draw_series(
-        self,
-        painter: QPainter,
-        rect: Any,
-        points: list[tuple[int, float]],
-        min_step: int,
-        max_step: int,
-        min_loss: float,
-        max_loss: float,
-        color: QColor,
-    ) -> None:
-        """Draw one line series.
-
-        Args:
-            painter: Active painter.
-            rect: Plot rectangle.
-            points: Step/loss pairs.
-            min_step: Minimum plotted step.
-            max_step: Maximum plotted step.
-            min_loss: Minimum plotted loss.
-            max_loss: Maximum plotted loss.
-            color: Series color.
-        """
-
-        if not points:
-            return
-        mapped = [
-            QPointF(
-                rect.left() + (step - min_step) / max(max_step - min_step, 1) * rect.width(),
-                rect.bottom() - (loss - min_loss) / max(max_loss - min_loss, 1e-9) * rect.height(),
-            )
-            for step, loss in points
-        ]
-        painter.setPen(QPen(color, 2))
-        for start, end in zip(mapped, mapped[1:]):
-            painter.drawLine(start, end)
-        painter.setBrush(QBrush(color))
-        for point in mapped[-8:]:
-            painter.drawEllipse(point, 2.5, 2.5)
 
 class MainWindow(QMainWindow):
     """Main PySide6 window for Micro LLM Creator."""
@@ -283,6 +91,12 @@ class MainWindow(QMainWindow):
         self.active_button_text = ""
         self.active_button_restore_text = ""
         self.current_project_file: Optional[Path] = None
+        self.telemetry_db_path: Optional[Path] = None
+        self.telemetry_run_id = ""
+        self.telemetry_latest_id = 0
+        self.telemetry_latest_index = 0
+        self.live_scrub_active = False
+        self.hardware_meter_labels: dict[int, QLabel] = {}
         self.training_cards: list[QWidget] = []
         self.training_controls_grid: Optional[QGridLayout] = None
         self.training_controls_columns = 3
@@ -388,22 +202,26 @@ class MainWindow(QMainWindow):
         rail_layout.setSpacing(12)
         self.dataset_nav = self._nav_button("⇩\nIN")
         self.training_nav = self._nav_button("✦\nAI")
+        self.live_nav = self._nav_button("LIVE")
         self.benchmark_nav = self._nav_button("◷\nBench")
         self.export_nav = self._nav_button("⇧\nX")
         self.chat_nav = self._nav_button("◌\nChat")
         self._tip(self.dataset_nav, "Open dataset preparation: load text/PDF files and build tokenizer data.")
         self._tip(self.training_nav, "Open model training: configure architecture and optimization settings.")
+        self._tip(self.live_nav, "Open the live training tracker with model flow, charts, metrics, and telemetry.")
         self._tip(self.benchmark_nav, "Open benchmark prompts: test checkpoint quality with repeatable prompts.")
         self._tip(self.export_nav, "Open export tools: bundle or quantize the trained model artifacts.")
         self._tip(self.chat_nav, "Open Chat: load a GGUF model once and send prompts.")
         self.dataset_nav.setChecked(True)
         self.dataset_nav.clicked.connect(lambda: self._switch_page(0))
         self.training_nav.clicked.connect(lambda: self._switch_page(1))
-        self.benchmark_nav.clicked.connect(lambda: self._switch_page(2))
-        self.export_nav.clicked.connect(lambda: self._switch_page(3))
-        self.chat_nav.clicked.connect(lambda: self._switch_page(4))
+        self.live_nav.clicked.connect(lambda: self._switch_page(2))
+        self.benchmark_nav.clicked.connect(lambda: self._switch_page(3))
+        self.export_nav.clicked.connect(lambda: self._switch_page(4))
+        self.chat_nav.clicked.connect(lambda: self._switch_page(5))
         rail_layout.addWidget(self.dataset_nav)
         rail_layout.addWidget(self.training_nav)
+        rail_layout.addWidget(self.live_nav)
         rail_layout.addWidget(self.benchmark_nav)
         rail_layout.addWidget(self.export_nav)
         rail_layout.addWidget(self.chat_nav)
@@ -412,6 +230,7 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_dataset_tab())
         self.pages.addWidget(self._build_training_tab())
+        self.pages.addWidget(self._build_live_training_tab())
         self.pages.addWidget(self._build_benchmark_tab())
         self.pages.addWidget(self._build_export_tab())
         self.pages.addWidget(self._build_chat_tab())
@@ -444,7 +263,7 @@ class MainWindow(QMainWindow):
         """
 
         self.pages.setCurrentIndex(index)
-        buttons = [self.dataset_nav, self.training_nav, self.benchmark_nav, self.export_nav, self.chat_nav]
+        buttons = [self.dataset_nav, self.training_nav, self.live_nav, self.benchmark_nav, self.export_nav, self.chat_nav]
         for button_index, button in enumerate(buttons):
             button.setChecked(button_index == index)
         self._refresh_training_layout()
@@ -499,191 +318,7 @@ class MainWindow(QMainWindow):
             Dataset page widget.
         """
 
-        page = self._panel()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        scroll = QScrollArea()
-        scroll.setObjectName("PageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        content = QWidget()
-        content.setObjectName("Panel")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(18, 18, 18, 10)
-        layout.setSpacing(10)
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
-        title = self._page_title("Data Ingestion Matrix")
-        layout.addWidget(title)
-
-        ingestion_body = QHBoxLayout()
-        ingestion_body.setSpacing(14)
-        left_column = QVBoxLayout()
-        left_column.setSpacing(10)
-        right_column = QVBoxLayout()
-        right_column.setSpacing(10)
-        ingestion_body.addLayout(left_column, 1)
-        ingestion_body.addLayout(right_column, 1)
-
-        source_form = QFormLayout()
-        self._configure_form(source_form)
-        tokenizer_form = QFormLayout()
-        self._configure_form(tokenizer_form)
-
-        form = QFormLayout()
-        self._configure_form(form)
-
-        self.input_dir = QLineEdit()
-        self._tip(self.input_dir, "Folder containing PDFs, text, Markdown, or JSONL files. More clean text usually improves the model.")
-        self.dataset_dir = QLineEdit(str(Path.cwd() / "runs" / "dataset"))
-        self._tip(self.dataset_dir, "Folder where prepared corpus, tokenizer, token files, and dataset summary are saved.")
-        self.auto_vocab = QCheckBox("Choose automatically")
-        self.auto_vocab.setChecked(True)
-        self._tip(self.auto_vocab, "Automatically choose vocabulary size based on corpus size and word variety. Safer for most users.")
-        self.manual_vocab_size = self._spin(256, 100000, 8000)
-        self.manual_vocab_size.setEnabled(False)
-        self._tip(self.manual_vocab_size, "Manual tokenizer vocabulary size. Larger vocab can preserve more words but increases model output size.")
-        self.auto_vocab.toggled.connect(lambda checked: self.manual_vocab_size.setEnabled(not checked and not self._tokenizer_strategy_reuses()))
-        self.auto_vocab_label = QLabel("Auto after reading files")
-        self.auto_vocab_label.setObjectName("Metric")
-        self._tip(self.auto_vocab_label, "The actual vocabulary size selected after reading the corpus.")
-        self.min_frequency = self._spin(1, 1000, 2)
-        self._tip(self.min_frequency, "Minimum token frequency for tokenizer training. Higher values remove rare fragments and can reduce noise.")
-        self.context_length = self._spin(16, 4096, 128)
-        self._tip(self.context_length, "Number of tokens per training sequence. Longer context lets the model learn longer dependencies but uses more memory.")
-        self.validation_split = self._double_spin(0.0, 0.5, 0.1, 0.01, 3)
-        self._tip(self.validation_split, "Fraction of tokens held out for validation. Validation helps detect overfitting during training.")
-        self.lowercase = QCheckBox("Lowercase text")
-        self._tip(self.lowercase, "Convert all text to lowercase. This shrinks vocabulary but removes capitalization patterns.")
-        self.max_workers = self._spin(1, 64, 4)
-        self._tip(self.max_workers, "Number of parallel file readers. More workers can speed PDF/text loading but uses more CPU and disk activity.")
-        self.prepare_mode = QComboBox()
-        self.prepare_mode.addItems(["Incremental update", "Full rebuild", "Force reprocess"])
-        self.prepare_mode.setMaximumWidth(260)
-        self._tip(
-            self.prepare_mode,
-            "Incremental update reuses cached extracted text and the existing tokenizer. Full rebuild rebuilds tokenizer/tokens. Force reprocess ignores cache.",
-        )
-        self.tokenizer_strategy = QComboBox()
-        self.tokenizer_strategy.addItems(["Auto", "Train new tokenizer", "Reuse dataset tokenizer", "Import tokenizer.json"])
-        self.tokenizer_strategy.setMaximumWidth(260)
-        self._tip(
-            self.tokenizer_strategy,
-            "Controls tokenizer reuse. Auto reuses the dataset tokenizer during incremental updates; Import lets you use a compatible tokenizer.json.",
-        )
-        self.tokenizer_path = QLineEdit()
-        self.tokenizer_path.setEnabled(False)
-        self._tip(self.tokenizer_path, "Existing tokenizer.json to import. Use this when continuing a compatible tokenizer family.")
-        self.tokenizer_strategy.currentTextChanged.connect(self._update_tokenizer_strategy_controls)
-        self.code_training_mode = QCheckBox("Code Training Mode")
-        self.code_training_mode.setChecked(True)
-        self._tip(self.code_training_mode, "Prepare a programming dataset by preserving source code, tagging code/prose, and extracting code-like blocks.")
-        self.include_prose = QCheckBox("Include explanations")
-        self.include_prose.setChecked(True)
-        self._tip(self.include_prose, "Keep prose from PDFs/books. This helps the model learn programming concepts and explanations.")
-        self.include_source_code = QCheckBox("Include source files")
-        self.include_source_code.setChecked(True)
-        self._tip(self.include_source_code, "Include real code files such as .py, .js, .java, .cpp, .cs, .go, .rs, and similar.")
-        self.extract_code_blocks = QCheckBox("Extract code blocks")
-        self.extract_code_blocks.setChecked(True)
-        self._tip(self.extract_code_blocks, "Try to detect code-like blocks inside PDFs/text and train them as code samples.")
-        self.preserve_indentation = QCheckBox("Preserve indentation")
-        self.preserve_indentation.setChecked(True)
-        self._tip(self.preserve_indentation, "Keep line breaks and indentation for code. This is important for Python and readable generated code.")
-        self.instruction_samples = QCheckBox("Instruction-style samples")
-        self.instruction_samples.setChecked(True)
-        self._tip(self.instruction_samples, "Wrap code samples with simple instruction tags so the model sees code as task-oriented examples.")
-        self.reasoning_sample_mode = QComboBox()
-        self.reasoning_sample_mode.addItems(["Reasoning scaffold", "Detailed code reasoning", "No reasoning wrapper"])
-        self.reasoning_sample_mode.setMaximumWidth(260)
-        self._tip(
-            self.reasoning_sample_mode,
-            "Shapes code samples as task/reasoning/answer examples. This teaches response structure, not guaranteed deep reasoning by itself.",
-        )
-        self.instruction_samples.toggled.connect(self.reasoning_sample_mode.setEnabled)
-
-        source_form.addRow("Source vault", self._path_row(self.input_dir, directory=True))
-        source_form.addRow("Dataset core", self._path_row(self.dataset_dir, directory=True))
-        source_form.addRow("Parallel lanes", self.max_workers)
-        source_form.addRow("Prepare mode", self.prepare_mode)
-        source_form.addRow("", self.lowercase)
-        source_form.addRow("", self.code_training_mode)
-        source_form.addRow("", self.include_source_code)
-
-        tokenizer_form.addRow("Auto vocabulary", self.auto_vocab)
-        tokenizer_form.addRow("Manual vocabulary", self.manual_vocab_size)
-        tokenizer_form.addRow("Selected vocab", self.auto_vocab_label)
-        self.tokenizer_path_row = self._path_row(self.tokenizer_path, directory=False, file_filter="Tokenizer JSON (*.json);;All files (*)")
-        self.tokenizer_path_row.setEnabled(False)
-        tokenizer_form.addRow("Tokenizer policy", self.tokenizer_strategy)
-        tokenizer_form.addRow("Import tokenizer", self.tokenizer_path_row)
-        tokenizer_form.addRow("Min frequency", self.min_frequency)
-        tokenizer_form.addRow("Context window", self.context_length)
-        tokenizer_form.addRow("Validation split", self.validation_split)
-        tokenizer_form.addRow("", self.include_prose)
-        tokenizer_form.addRow("", self.extract_code_blocks)
-        tokenizer_form.addRow("", self.preserve_indentation)
-        tokenizer_form.addRow("", self.instruction_samples)
-        tokenizer_form.addRow("Reasoning samples", self.reasoning_sample_mode)
-        source_card = self._card("SOURCE ARRAY", source_form)
-        source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        tokenizer_card = self._card("TOKENIZER CORE", tokenizer_form)
-        tokenizer_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        left_column.addWidget(source_card, 0)
-        right_column.addWidget(tokenizer_card, 0)
-
-        quality_grid = QGridLayout()
-        quality_grid.setHorizontalSpacing(8)
-        quality_grid.setVerticalSpacing(8)
-        self.dataset_quality_samples = self._metric_chip("Samples: -", "Training samples after PDF/text/code expansion.")
-        self.dataset_quality_tokens = self._metric_chip("Tokens: -", "Total encoded tokens available for training.")
-        self.dataset_quality_vocab = self._metric_chip("Vocab: -", "Tokenizer vocabulary size used by the dataset.")
-        self.dataset_quality_code = self._metric_chip("Code/prose: -", "Code and prose sample split.")
-        self.dataset_quality_cache = self._metric_chip("Cache: -", "Files reused from cache versus processed this run.")
-        self.dataset_quality_warning = self._metric_chip("Warnings: none", "Dataset quality warnings, if any.")
-        quality_items = [
-            self.dataset_quality_samples,
-            self.dataset_quality_tokens,
-            self.dataset_quality_vocab,
-            self.dataset_quality_code,
-            self.dataset_quality_cache,
-            self.dataset_quality_warning,
-        ]
-        for index, item in enumerate(quality_items):
-            quality_grid.addWidget(item, index // 3, index % 3)
-        quality_card = self._card("DATASET QUALITY", quality_grid)
-        quality_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        right_column.addWidget(quality_card, 0)
-
-        self.prepare_button = QPushButton("Prepare Dataset")
-        self._tip(self.prepare_button, "Read source files, clean text, train tokenizer, split tokens, and save the dataset project.")
-        self.prepare_button.clicked.connect(self.prepare_dataset)
-        self.prepare_button.setMaximumWidth(320)
-        self.stop_dataset_button = QPushButton("Stop")
-        self.stop_dataset_button.setEnabled(False)
-        self.stop_dataset_button.setMaximumWidth(120)
-        self.stop_dataset_button.clicked.connect(self.stop_active_task)
-        self._tip(self.stop_dataset_button, "Request a graceful stop for dataset preparation.")
-
-        self.dataset_log = QTextEdit()
-        self.dataset_log.setReadOnly(True)
-        self.dataset_log.setMinimumHeight(260)
-        self.dataset_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        log_layout = QVBoxLayout()
-        log_layout.addWidget(self.dataset_log, 1)
-        left_column.addWidget(self._card("INGEST TELEMETRY", log_layout), 1)
-        right_column.addStretch(1)
-        layout.addLayout(ingestion_body, 1)
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.prepare_button)
-        action_row.addWidget(self.stop_dataset_button)
-        action_row.addStretch(1)
-        layout.addLayout(action_row)
-
-        self.dataset_progress = self._thin_progress()
-        outer.addWidget(self.dataset_progress)
-        return page
+        return build_dataset_tab(self)
 
     def _build_training_tab(self) -> QWidget:
         """Build the training configuration page.
@@ -692,234 +327,194 @@ class MainWindow(QMainWindow):
             Training page widget.
         """
 
-        page = self._panel()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        scroll = QScrollArea()
-        scroll.setObjectName("PageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        content = QWidget()
-        content.setObjectName("Panel")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(18, 18, 18, 10)
-        layout.setSpacing(10)
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
-        layout.addWidget(self._page_title("Neural Forge"))
-        training_body = QHBoxLayout()
-        training_body.setSpacing(12)
-        left_zone = QVBoxLayout()
-        left_zone.setSpacing(10)
-        right_zone = QVBoxLayout()
-        right_zone.setSpacing(10)
-        training_body.addLayout(left_zone, 2)
-        training_body.addLayout(right_zone, 1)
-        layout.addLayout(training_body, 1)
+        return build_training_tab(self)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
+    def _build_live_training_tab(self) -> QWidget:
+        """Build the live training tracker page.
 
-        left = QFormLayout()
-        self._configure_form(left)
-        self.train_data_dir = QLineEdit(str(Path.cwd() / "runs" / "dataset"))
-        self._tip(self.train_data_dir, "Prepared dataset folder containing tokenizer.json and train/validation token files.")
-        self.model_dir = QLineEdit(str(Path.cwd() / "runs" / "model"))
-        self._tip(self.model_dir, "Folder where checkpoints, final model, tokenizer copy, and training summary are saved.")
-        self.preset = QComboBox()
-        self.preset.addItems(["Tiny", "Small", "Custom"])
-        self.preset.setMaximumWidth(260)
-        self._tip(self.preset, "Architecture preset. Tiny is faster; Small has more capacity but needs more memory and training data.")
-        self.preset.currentTextChanged.connect(self._apply_preset)
-        self.architecture_style = QComboBox()
-        self.architecture_style.addItems(["Classic GPT", "Llama-like"])
-        self.architecture_style.setMaximumWidth(260)
-        self._tip(
-            self.architecture_style,
-            "Classic uses learned positions, LayerNorm, and GELU. Llama-like uses RoPE, RMSNorm, and SwiGLU.",
+        Returns:
+            Live training tracker page widget.
+        """
+
+        return build_live_training_tab(self)
+
+    def _init_telemetry_store(self, model_dir: Path) -> None:
+        """Create or reset the SQLite telemetry store for a training run.
+
+        Args:
+            model_dir: Model output directory.
+        """
+
+        self.telemetry_db_path = initialize_store(model_dir)
+        self.telemetry_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.telemetry_latest_id = 0
+        self.telemetry_latest_index = 0
+        self.live_time_slider.setRange(0, 0)
+        self.live_time_slider.setValue(0)
+        self.live_timeline_label.setText("Timeline: live")
+        self.live_scrub_active = False
+
+    def _record_live_metric(self, event: dict[str, Any]) -> None:
+        """Persist one live training metric event to SQLite.
+
+        Args:
+            event: Training progress event.
+        """
+
+        if self.telemetry_db_path is None or not self.telemetry_run_id or event.get("step") is None:
+            return
+        self.telemetry_latest_id = insert_metric(self.telemetry_db_path, self.telemetry_run_id, event)
+        self.telemetry_latest_index += 1
+        self.live_time_slider.blockSignals(True)
+        self.live_time_slider.setRange(0, self.telemetry_latest_index)
+        if not self.live_scrub_active:
+            self.live_time_slider.setValue(self.telemetry_latest_index)
+            self.live_timeline_label.setText("Timeline: live")
+        self.live_time_slider.blockSignals(False)
+
+    def _load_existing_telemetry(self, model_dir: Path) -> None:
+        """Load the latest saved telemetry run for an opened project.
+
+        Args:
+            model_dir: Model output directory that may contain ``training_telemetry.sqlite``.
+        """
+
+        db_path = telemetry_db_path(model_dir)
+        self.telemetry_db_path = db_path if db_path.exists() else None
+        self.telemetry_run_id = ""
+        self.telemetry_latest_id = 0
+        self.telemetry_latest_index = 0
+        self.live_scrub_active = False
+        self.live_time_slider.blockSignals(True)
+        self.live_time_slider.setRange(0, 0)
+        self.live_time_slider.setValue(0)
+        self.live_time_slider.blockSignals(False)
+        self.live_timeline_label.setText("Timeline: no saved telemetry")
+        self.live_sample_text.setText("Training text: -")
+        if self.telemetry_db_path is None:
+            return
+        try:
+            run_row = latest_run(self.telemetry_db_path)
+            if run_row is None:
+                self.live_timeline_label.setText("Timeline: no samples")
+                return
+            self.telemetry_run_id = str(run_row["run_id"])
+            self.telemetry_latest_index = int(run_row["sample_count"] or 0)
+            self.telemetry_latest_id = int(run_row["latest_id"] or 0)
+        except sqlite3.Error as exc:
+            self.live_timeline_label.setText("Timeline: could not load")
+            self.training_log.append(f"Telemetry load warning: {exc}")
+            return
+        self.live_time_slider.blockSignals(True)
+        self.live_time_slider.setRange(0, self.telemetry_latest_index)
+        self.live_time_slider.setValue(self.telemetry_latest_index)
+        self.live_time_slider.blockSignals(False)
+        if self.telemetry_latest_index:
+            rows = self._timeline_rows_until(self.telemetry_latest_index)
+            if rows:
+                self._apply_timeline_rows(rows)
+
+    def _timeline_rows_until(self, sample_index: int) -> list[sqlite3.Row]:
+        """Load telemetry rows up to a selected sample index.
+
+        Args:
+            sample_index: Maximum number of samples to load for the active run.
+
+        Returns:
+            Ordered telemetry rows for the active run.
+        """
+
+        if self.telemetry_db_path is None or not self.telemetry_run_id or sample_index <= 0:
+            return []
+        return rows_until(self.telemetry_db_path, self.telemetry_run_id, sample_index)
+
+    def _begin_live_scrub(self) -> None:
+        """Pause live auto-follow while the timeline slider is being dragged."""
+
+        self.live_scrub_active = True
+
+    def _end_live_scrub(self) -> None:
+        """Apply the selected timeline snapshot after slider drag."""
+
+        self._scrub_live_timeline(self.live_time_slider.value())
+
+    def _jump_live_timeline_to_latest(self) -> None:
+        """Return timeline display to the latest live point."""
+
+        self.live_scrub_active = False
+        self.live_time_slider.setValue(self.telemetry_latest_index)
+        self._scrub_live_timeline(self.telemetry_latest_index)
+        self.live_timeline_label.setText("Timeline: live")
+
+    def _scrub_live_timeline(self, sample_index: int) -> None:
+        """Replay charts and live visual widgets to a selected telemetry point.
+
+        Args:
+            sample_index: Timeline sample selected by the slider.
+        """
+
+        rows = self._timeline_rows_until(sample_index)
+        if not rows:
+            return
+        self._apply_timeline_rows(rows)
+
+    def _apply_timeline_rows(self, rows: list[sqlite3.Row]) -> None:
+        """Apply historical telemetry rows to charts and live widgets.
+
+        Args:
+            rows: Ordered SQLite telemetry rows.
+        """
+
+        def series(name: str) -> list[tuple[int, float]]:
+            return [(int(row["step"]), float(row[name])) for row in rows if row[name] is not None]
+
+        latest = rows[-1]
+        self.loss_chart.set_points(series("train_loss"), series("val_loss"))
+        self.optimization_chart.set_points(series("learning_rate"), series("grad_norm"))
+        self.stability_chart.set_points(series("weight_norm"), series("update_ratio"))
+        self.throughput_chart.set_points(series("tokens_per_second"), series("samples_per_second"))
+        self.memory_chart.set_points(series("vram_allocated_gb"), series("vram_reserved_gb"))
+        snapshot = {key: latest[key] for key in latest.keys()}
+        sample_text = str(snapshot.get("sample_text") or "").strip()
+        if sample_text:
+            self.live_sample_text.setText(f"Training text: {self._compact_preview_text(sample_text, 220)}")
+        else:
+            self.live_sample_text.setText("Training text: -")
+        self._update_live_training_metrics(
+            int(latest["step"]),
+            snapshot,
+            snapshot.get("train_loss"),
+            snapshot.get("learning_rate"),
+            snapshot.get("grad_norm"),
+            snapshot.get("update_ratio"),
+            snapshot.get("tokens_per_second"),
+            snapshot.get("samples_per_second"),
+            snapshot.get("vram_allocated_gb"),
+            snapshot.get("vram_reserved_gb"),
+            snapshot.get("gpu_memory_percent"),
+            snapshot.get("system_cpu_percent"),
+            snapshot.get("system_ram_percent"),
+            snapshot.get("data_loader_workers"),
         )
-        self.n_embd = self._spin(32, 4096, 128)
-        self._tip(self.n_embd, "Embedding size, also called n_embd. Larger values increase model capacity and memory usage.")
-        self.n_head = self._spin(1, 64, 4)
-        self._tip(self.n_head, "Attention head count. More heads can model varied relationships, but n_embd must divide evenly by n_head.")
-        self.n_layer = self._spin(1, 64, 4)
-        self._tip(self.n_layer, "Transformer layer count. More layers improve capacity and reasoning patterns but slow training.")
-        self.train_context_length = self._spin(16, 4096, 128)
-        self._tip(self.train_context_length, "Training context length in tokens. Must fit your GPU/CPU memory.")
-        self.dropout = self._double_spin(0.0, 0.9, 0.1, 0.01, 3)
-        self._tip(self.dropout, "Dropout regularization. Higher values reduce overfitting but can slow learning.")
-        left.addRow("Dataset", self._path_row(self.train_data_dir, directory=True))
-        left.addRow("Model", self._path_row(self.model_dir, directory=True))
-        left.addRow("Preset", self.preset)
-        left.addRow("Block style", self.architecture_style)
-        left.addRow("n_embd", self.n_embd)
-        left.addRow("n_head", self.n_head)
-        left.addRow("n_layer", self.n_layer)
-        left.addRow("Context length", self.train_context_length)
-        left.addRow("Dropout", self.dropout)
+        timestamp = datetime.fromtimestamp(float(latest["recorded_at"])).strftime("%H:%M:%S")
+        self.live_timeline_label.setText(f"Timeline: step {int(latest['step']):,} @ {timestamp}")
 
-        right = QFormLayout()
-        self._configure_form(right)
-        self.epochs = self._spin(1, 10000, 5)
-        self._tip(self.epochs, "Number of full passes over the training tokens. More epochs can improve learning or overfit small data.")
-        self.batch_size = self._spin(1, 512, 16)
-        self._tip(self.batch_size, "Sequences processed per step. Larger batches are smoother but require more memory.")
-        self.learning_rate = self._double_spin(0.000001, 1.0, 0.0003, 0.0001, 6)
-        self._tip(self.learning_rate, "Optimizer step size. Too high can destabilize training; too low trains slowly.")
-        self.weight_decay = self._double_spin(0.0, 1.0, 0.1, 0.01, 4)
-        self._tip(self.weight_decay, "Weight decay regularization. Helps control overfitting by discouraging large weights.")
-        self.gradient_accumulation = self._spin(1, 256, 1)
-        self._tip(self.gradient_accumulation, "Accumulate gradients across batches before updating. Simulates larger batches with less memory.")
-        self.warmup_steps = self._spin(0, 1_000_000, 100)
-        self._tip(self.warmup_steps, "Steps used to ramp up learning rate. Warmup helps avoid unstable early training.")
-        self.eval_interval = self._spin(0, 1_000_000, 100)
-        self._tip(self.eval_interval, "Training steps between validation checks. Set 0 to skip interval validation.")
-        self.save_interval = self._spin(1, 1_000_000, 500)
-        self._tip(self.save_interval, "Training steps between checkpoints. Lower values improve crash recovery but use more disk.")
-        self.max_grad_norm = self._double_spin(0.1, 100.0, 1.0, 0.1, 3)
-        self._tip(self.max_grad_norm, "Gradient clipping limit. Helps prevent exploding gradients during training.")
-        self.seed = self._spin(1, 2_147_483_647, 1337)
-        self._tip(self.seed, "Random seed for reproducible initialization and sampling order.")
-        self.device = QComboBox()
-        self.device.setMaximumWidth(260)
-        self._tip(self.device, "Hardware target. CUDA uses NVIDIA GPU when available; CPU is slower but broadly compatible.")
-        self.device_info = QLabel()
-        self.device_info.setObjectName("Metric")
-        self.device_info.setWordWrap(True)
-        self.device_info.setMaximumWidth(260)
-        self._configure_device_options()
-        self.use_amp = QCheckBox("Mixed precision")
-        self.use_amp.setChecked(self.use_amp_default)
-        self._tip(self.use_amp, "Use mixed precision on CUDA. Usually faster and lighter on GPU memory.")
-        self.resume_training = QCheckBox("Resume latest")
-        self.resume_training.setChecked(True)
-        self._tip(self.resume_training, "Continue from the latest checkpoint if training was interrupted.")
-        self.resume_safety = QCheckBox("Safe resume")
-        self.resume_safety.setChecked(True)
-        self._tip(
-            self.resume_safety,
-            "Before resuming, verify that the dataset tokenizer and model architecture match the checkpoint.",
-        )
-        self.resume_checkpoint = QLineEdit()
-        self._tip(self.resume_checkpoint, "Optional specific checkpoint file to resume from instead of the latest checkpoint.")
-        right.addRow("Epochs", self.epochs)
-        right.addRow("Batch", self.batch_size)
-        right.addRow("LR", self.learning_rate)
-        right.addRow("Decay", self.weight_decay)
-        right.addRow("Grad accum", self.gradient_accumulation)
-        right.addRow("Warmup", self.warmup_steps)
-        right.addRow("Eval every", self.eval_interval)
-        right.addRow("Save every", self.save_interval)
-        right.addRow("Max grad", self.max_grad_norm)
-        right.addRow("Seed", self.seed)
-        runtime = QFormLayout()
-        self._configure_form(runtime)
-        runtime.addRow("Device", self.device)
-        runtime.addRow("Hardware", self.device_info)
-        runtime.addRow("", self.use_amp)
-        runtime.addRow("", self.resume_training)
-        runtime.addRow("", self.resume_safety)
-        runtime.addRow("Checkpoint", self._path_row(self.resume_checkpoint, directory=False))
+    @staticmethod
+    def _compact_preview_text(text: str, limit: int = 220) -> str:
+        """Normalize a training preview into a compact single line.
 
-        self.training_cards = [
-            self._card("MODEL ARCHITECTURE", left),
-            self._card("OPTIMIZATION ENGINE", right),
-        ]
-        for card in self.training_cards:
-            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        for index, card in enumerate(self.training_cards):
-            grid.addWidget(card, 0, index)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        self.training_controls_grid = grid
-        self.training_controls_columns = 2
-        controls = QWidget()
-        controls.setLayout(grid)
-        controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        self.training_controls = controls
-        left_zone.addWidget(controls, 0)
-        right_zone.addWidget(self._card("RUNTIME CONTROL", runtime), 0)
+        Args:
+            text: Raw decoded preview text.
+            limit: Maximum number of displayed characters.
 
-        self.train_button = QPushButton("Start Training")
-        self._tip(self.train_button, "Start or resume training using the selected model and optimizer settings.")
-        self.train_button.clicked.connect(self.start_training)
-        self.train_button.setMaximumWidth(320)
-        self.stop_training_button = QPushButton("Stop")
-        self.stop_training_button.setEnabled(False)
-        self.stop_training_button.setMaximumWidth(120)
-        self.stop_training_button.clicked.connect(self.stop_active_task)
-        self._tip(self.stop_training_button, "Request a graceful stop and save a resumable checkpoint.")
+        Returns:
+            Single-line text preview.
+        """
 
-        metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(8)
-        metrics_grid.setVerticalSpacing(8)
-        self.training_epoch_metric = self._metric_chip("Epoch: -", "Current epoch and total epochs.")
-        self.training_step_metric = self._metric_chip("Step: -", "Current optimizer step and total planned steps.")
-        self.training_loss_metric = self._metric_chip("Train loss: -", "Latest training loss. Lower is usually better.")
-        self.training_val_metric = self._metric_chip("Val loss: -", "Latest validation loss when validation is enabled.")
-        self.training_lr_metric = self._metric_chip("LR: -", "Current learning rate from the scheduler.")
-        self.training_speed_metric = self._metric_chip("Speed: -", "Current training throughput.")
-        self.training_grad_metric = self._metric_chip("Grad: -", "Current gradient norm.")
-        self.training_vram_metric = self._metric_chip("VRAM: -", "Current CUDA memory usage when training on GPU.")
-        self.training_eta_metric = self._metric_chip("ETA: -", "Estimated time remaining based on recent optimizer steps.")
-        for index, metric in enumerate((
-            self.training_eta_metric,
-            self.training_epoch_metric,
-            self.training_step_metric,
-            self.training_loss_metric,
-            self.training_val_metric,
-            self.training_lr_metric,
-            self.training_speed_metric,
-            self.training_grad_metric,
-            self.training_vram_metric,
-        )):
-            metrics_grid.addWidget(metric, index, 0)
-        metrics_layout = QVBoxLayout()
-        metrics_layout.setSpacing(8)
-        metrics_layout.addLayout(metrics_grid)
-        self.loss_chart = LossChartWidget()
-        self._tip(self.loss_chart, "Live training and validation loss. Falling values usually mean the model is learning.")
-        self.optimization_chart = LossChartWidget("LR", "Grad", "Learning rate and gradient norm will appear during training")
-        self._tip(self.optimization_chart, "Learning rate and gradient norm. Watch for unstable spikes or gradients collapsing toward zero.")
-        self.stability_chart = LossChartWidget("Weight", "Update", "Weight norm and update ratio will appear during training")
-        self._tip(self.stability_chart, "Weight norm and parameter update ratio. Large update ratios can destabilize training; tiny ratios can stall learning.")
-        self.throughput_chart = LossChartWidget("Tok/s", "Samples/s", "Throughput will appear during training")
-        self._tip(self.throughput_chart, "Training speed measured as tokens/sec and samples/sec.")
-        self.memory_chart = LossChartWidget("VRAM alloc", "VRAM reserved", "VRAM usage will appear during CUDA training")
-        self._tip(self.memory_chart, "CUDA memory usage in GB. Helps diagnose memory bottlenecks.")
-        charts_grid = QGridLayout()
-        charts_grid.setHorizontalSpacing(8)
-        charts_grid.setVerticalSpacing(8)
-        charts_grid.addWidget(self.loss_chart, 0, 0)
-        charts_grid.addWidget(self.optimization_chart, 0, 1)
-        charts_grid.addWidget(self.stability_chart, 1, 0)
-        charts_grid.addWidget(self.throughput_chart, 1, 1)
-        charts_grid.addWidget(self.memory_chart, 2, 0, 1, 2)
-        charts_grid.setColumnStretch(0, 1)
-        charts_grid.setColumnStretch(1, 1)
-        left_zone.addWidget(self._card("TRAINING GRAPHS", charts_grid), 1)
-        right_zone.addWidget(self._card("TRAINING METRICS", metrics_layout), 0)
-
-        self.training_log = QTextEdit()
-        self.training_log.setReadOnly(True)
-        self.training_log.setMinimumHeight(320)
-        self.training_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        telemetry_layout = QVBoxLayout()
-        telemetry_layout.addWidget(self.training_log, 1)
-        right_zone.addWidget(self._card("TRAINING TELEMETRY", telemetry_layout), 1)
-
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.train_button)
-        action_row.addWidget(self.stop_training_button)
-        action_row.addStretch(1)
-        layout.addLayout(action_row)
-
-        self.training_progress = self._thin_progress()
-        outer.addWidget(self.training_progress)
-        QTimer.singleShot(0, self._refresh_training_layout)
-        return page
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 3)].rstrip() + "..."
 
     def _build_export_tab(self) -> QWidget:
         """Build the export page.
@@ -928,93 +523,7 @@ class MainWindow(QMainWindow):
             Export page widget.
         """
 
-        page = self._panel()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        scroll = QScrollArea()
-        scroll.setObjectName("PageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        content = QWidget()
-        content.setObjectName("Panel")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(18, 18, 18, 10)
-        layout.setSpacing(10)
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
-        layout.addWidget(self._page_title("Export Bay"))
-
-        form = QFormLayout()
-        self._configure_form(form)
-        self.export_model_dir = QLineEdit(str(Path.cwd() / "runs" / "model"))
-        self._tip(self.export_model_dir, "Trained model folder containing final_model.pt and tokenizer.json.")
-        self.export_dir = QLineEdit(str(Path.cwd() / "runs" / "export"))
-        self._tip(self.export_dir, "Folder where export bundles or quantized checkpoints are written.")
-        self.quant_mode = QComboBox()
-        self.quant_mode.addItems(["FP16 checkpoint", "GGUF Q8_0 (planned)", "GGUF Q4_K_M (planned)", "GGUF Q5_K_M (planned)"])
-        self.quant_mode.setMaximumWidth(260)
-        self._tip(self.quant_mode, "Quantization target. FP16 reduces checkpoint size now; GGUF modes are planned for llama.cpp export.")
-        self.llama_cpp_dir = QLineEdit()
-        self._tip(self.llama_cpp_dir, "Local llama.cpp checkout containing convert_hf_to_gguf.py.")
-        self.gguf_output_path = QLineEdit(str(Path.cwd() / "runs" / "export" / "model.gguf"))
-        self._tip(self.gguf_output_path, "Destination GGUF file. Requires an HF-compatible hf_model folder in the model core.")
-        self.gguf_outtype = QComboBox()
-        self.gguf_outtype.addItems(["f16", "f32", "bf16", "q8_0"])
-        self.gguf_outtype.setMaximumWidth(260)
-        self._tip(self.gguf_outtype, "llama.cpp converter outtype. f16 is the usual starting point.")
-        form.addRow("Model core", self._path_row(self.export_model_dir, directory=True))
-        form.addRow("Output bay", self._path_row(self.export_dir, directory=True))
-        form.addRow("Quantization", self.quant_mode)
-        form.addRow("llama.cpp", self._path_row(self.llama_cpp_dir, directory=True))
-        form.addRow("GGUF output", self._path_row(self.gguf_output_path, directory=False, file_filter="GGUF models (*.gguf);;All files (*)"))
-        form.addRow("GGUF outtype", self.gguf_outtype)
-        layout.addWidget(self._card("ARTIFACT CONFIGURATION", form))
-
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        bundle_button = QPushButton("Create Bundle")
-        self._tip(bundle_button, "Copy final model, tokenizer, and summary into a portable export folder.")
-        bundle_button.clicked.connect(self.create_bundle)
-        quant_button = QPushButton("Quantize Model")
-        self._tip(quant_button, "Create a smaller FP16 checkpoint for inference or later conversion workflows.")
-        quant_button.clicked.connect(self.quantize_model)
-        hf_button = QPushButton("Export HF Package")
-        self._tip(hf_button, "Create model_core/hf_model with config, weights, tokenizer, lineage, and README.")
-        hf_button.clicked.connect(self.export_hf_package)
-        self.gguf_convert_button = QPushButton("Convert HF to GGUF")
-        self._tip(self.gguf_convert_button, "Run llama.cpp convert_hf_to_gguf.py for model_core/hf_model when available.")
-        self.gguf_convert_button.clicked.connect(self.convert_hf_to_gguf)
-        bundle_button.setMaximumWidth(220)
-        quant_button.setMaximumWidth(220)
-        hf_button.setMaximumWidth(220)
-        self.gguf_convert_button.setMaximumWidth(220)
-        row.addWidget(bundle_button)
-        row.addWidget(quant_button)
-        row.addWidget(hf_button)
-        row.addWidget(self.gguf_convert_button)
-        row.addStretch(1)
-
-        self.export_log = QTextEdit()
-        self.export_log.setReadOnly(True)
-        self.export_log.setMinimumHeight(320)
-        self.export_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.export_log.setPlainText(
-            "Export options:\n"
-            "- Bundle copies final_model.pt, tokenizer.json, and training_summary.json.\n"
-            "- HF package writes model_core/hf_model for portable MicroGPT loading.\n"
-            "- FP16 checkpoint quantization works now.\n"
-            "- GGUF conversion uses llama.cpp when model_core/hf_model exists.\n"
-            "- Native MicroGPT checkpoints are not written as fake GGUF files.\n"
-        )
-        export_log_layout = QVBoxLayout()
-        export_log_layout.addWidget(self.export_log, 1)
-        layout.addWidget(self._card("EXPORT TELEMETRY", export_log_layout), 1)
-        layout.addLayout(row)
-
-        self.export_progress = self._thin_progress()
-        outer.addWidget(self.export_progress)
-        return page
+        return build_export_tab(self)
 
     def _build_benchmark_tab(self) -> QWidget:
         """Build the benchmark prompt page.
@@ -1023,68 +532,7 @@ class MainWindow(QMainWindow):
             Benchmark page widget.
         """
 
-        page = self._panel()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        scroll = QScrollArea()
-        scroll.setObjectName("PageScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        content = QWidget()
-        content.setObjectName("Panel")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(18, 18, 18, 10)
-        layout.setSpacing(10)
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
-        layout.addWidget(self._page_title("Benchmark Console"))
-
-        benchmark_grid = QGridLayout()
-        benchmark_grid.setHorizontalSpacing(12)
-        benchmark_grid.setVerticalSpacing(8)
-        self.benchmark_prompts = QTextEdit()
-        self.benchmark_prompts.setMinimumHeight(260)
-        self.benchmark_prompts.setPlainText("\n\n".join(DEFAULT_BENCHMARK_PROMPTS))
-        self._tip(self.benchmark_prompts, "Benchmark prompts separated by blank lines. Run the same prompts after each training run.")
-        self.benchmark_tokens = self._spin(16, 1024, 128)
-        self._tip(self.benchmark_tokens, "Maximum generated tokens per benchmark prompt.")
-        self.benchmark_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
-        self._tip(self.benchmark_temperature, "Sampling randomness for benchmark generation.")
-        self.benchmark_kv_cache = QCheckBox("Use KV cache")
-        self.benchmark_kv_cache.setChecked(True)
-        self._tip(self.benchmark_kv_cache, "Reuse attention key/value tensors during MicroGPT benchmark generation for faster inference.")
-        self.run_benchmark_button = QPushButton("Run Benchmark")
-        self.run_benchmark_button.setMaximumWidth(180)
-        self.run_benchmark_button.clicked.connect(self.run_benchmark)
-        self._tip(self.run_benchmark_button, "Generate benchmark outputs from final_model.pt and save a benchmark JSON file.")
-        self.stop_benchmark_button = QPushButton("Stop")
-        self.stop_benchmark_button.setMaximumWidth(120)
-        self.stop_benchmark_button.setEnabled(False)
-        self.stop_benchmark_button.clicked.connect(self.stop_active_task)
-        self._tip(self.stop_benchmark_button, "Request a graceful stop for benchmark generation.")
-        benchmark_grid.addWidget(self.benchmark_prompts, 0, 0, 5, 1)
-        benchmark_grid.addWidget(QLabel("Max tokens"), 0, 1)
-        benchmark_grid.addWidget(self.benchmark_tokens, 0, 2)
-        benchmark_grid.addWidget(QLabel("Temperature"), 1, 1)
-        benchmark_grid.addWidget(self.benchmark_temperature, 1, 2)
-        benchmark_grid.addWidget(self.benchmark_kv_cache, 2, 1, 1, 2)
-        benchmark_grid.addWidget(self.run_benchmark_button, 3, 1, 1, 2)
-        benchmark_grid.addWidget(self.stop_benchmark_button, 4, 1, 1, 2)
-        benchmark_grid.setColumnStretch(0, 1)
-        layout.addWidget(self._card("BENCHMARK PROMPTS", benchmark_grid), 0)
-
-        self.benchmark_log = QTextEdit()
-        self.benchmark_log.setReadOnly(True)
-        self.benchmark_log.setMinimumHeight(260)
-        self.benchmark_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        benchmark_log_layout = QVBoxLayout()
-        benchmark_log_layout.addWidget(self.benchmark_log, 1)
-        layout.addWidget(self._card("BENCHMARK TELEMETRY", benchmark_log_layout), 1)
-
-        self.benchmark_progress = self._thin_progress()
-        outer.addWidget(self.benchmark_progress)
-        return page
+        return build_benchmark_tab(self)
 
     def _build_chat_tab(self) -> QWidget:
         """Build the GGUF model test chat page.
@@ -1093,140 +541,7 @@ class MainWindow(QMainWindow):
             Chat page widget.
         """
 
-        page = self._panel()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 20, 24, 14)
-        layout.setSpacing(12)
-
-        main = QHBoxLayout()
-        main.setSpacing(14)
-
-        chat_column = QVBoxLayout()
-        chat_column.setSpacing(10)
-
-        self.chat_scroll = QScrollArea()
-        self.chat_scroll.setObjectName("ChatScroll")
-        self.chat_scroll.setWidgetResizable(True)
-        self.chat_scroll.setMinimumHeight(420)
-        self._tip(self.chat_scroll, "Rendered Markdown conversation view.")
-        self.chat_canvas = QWidget()
-        self.chat_canvas.setObjectName("ChatCanvas")
-        self.chat_messages = QVBoxLayout(self.chat_canvas)
-        self.chat_messages.setContentsMargins(14, 14, 14, 14)
-        self.chat_messages.setSpacing(12)
-        self.chat_messages.addStretch(1)
-        self.chat_scroll.setWidget(self.chat_canvas)
-        self.chat_event_log = QTextEdit()
-        self.chat_event_log.setVisible(False)
-        self._add_chat_message("assistant", "Load a GGUF model to start testing.")
-        self.chat_stats = QLabel("Idle")
-        self.chat_stats.setObjectName("Metric")
-        self.chat_stats.setVisible(False)
-        self._tip(self.chat_stats, "Generation timing, produced tokens, and approximate token speed.")
-        chat_column.addWidget(self.chat_scroll, 1)
-
-        prompt_row = QHBoxLayout()
-        prompt_row.setSpacing(10)
-        self.chat_input = ChatInputEdit()
-        self.chat_input.setObjectName("ChatInput")
-        self.chat_input.setMaximumHeight(92)
-        self.chat_input.setPlaceholderText("Send a message...")
-        self._tip(self.chat_input, "Prompt to send to the loaded model.")
-        self.chat_input.sendRequested.connect(self.send_chat_message)
-        self.send_chat_button = QPushButton("Send")
-        self.send_chat_button.setMaximumWidth(120)
-        self.send_chat_button.clicked.connect(self.send_chat_message)
-        self._tip(self.send_chat_button, "Send the message to the already loaded model.")
-        self.stop_chat_button = QPushButton("Stop")
-        self.stop_chat_button.setMaximumWidth(120)
-        self.stop_chat_button.setEnabled(False)
-        self.stop_chat_button.clicked.connect(self.stop_active_task)
-        self._tip(self.stop_chat_button, "Stop the current streamed reply.")
-        prompt_row.addWidget(self.chat_input, 1)
-        prompt_row.addWidget(self.send_chat_button)
-        prompt_row.addWidget(self.stop_chat_button)
-        chat_column.addLayout(prompt_row)
-
-        settings_column = QVBoxLayout()
-        settings_column.setSpacing(12)
-        settings_panel = QWidget()
-        settings_panel.setMaximumWidth(390)
-        settings_panel.setMinimumWidth(340)
-        settings_panel.setLayout(settings_column)
-
-        model_form = QFormLayout()
-        self._configure_form(model_form)
-        self.gguf_path = QLineEdit()
-        self._tip(self.gguf_path, "Path to a GGUF model file produced by llama.cpp-compatible export tooling.")
-        self.llama_context = self._spin(256, 131072, 2048)
-        self._tip(self.llama_context, "llama.cpp context window. Larger values allow longer chats but use more memory.")
-        self.llama_threads = self._spin(1, 128, 4)
-        self._tip(self.llama_threads, "CPU threads used by llama.cpp inference.")
-        self.llama_gpu_layers = self._spin(-1, 200, -1)
-        self._tip(self.llama_gpu_layers, "Number of transformer layers to offload to GPU. Use -1 to offload all possible layers.")
-        model_form.addRow("GGUF model", self._path_row(self.gguf_path, directory=False, file_filter="GGUF models (*.gguf);;All files (*)"))
-        model_form.addRow("Context", self.llama_context)
-        model_form.addRow("CPU threads", self.llama_threads)
-        model_form.addRow("GPU layers", self.llama_gpu_layers)
-        self.load_llm_button = QPushButton("Load Model")
-        self.load_llm_button.setMaximumWidth(180)
-        self.load_llm_button.clicked.connect(self.toggle_llm_model)
-        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
-        self.reset_chat_button = QPushButton("Reset Chat")
-        self.reset_chat_button.setMaximumWidth(180)
-        self.reset_chat_button.clicked.connect(self.reset_chat)
-        self._tip(self.reset_chat_button, "Clear conversation memory while keeping the model loaded.")
-        loader_buttons = QHBoxLayout()
-        loader_buttons.addWidget(self.load_llm_button)
-        loader_buttons.addWidget(self.reset_chat_button)
-        loader_buttons.addStretch(1)
-        model_form.addRow("", loader_buttons)
-
-        sample_form = QFormLayout()
-        self._configure_form(sample_form)
-        self.thinking_enabled = QCheckBox("Thinking")
-        self.thinking_enabled.setChecked(True)
-        self._tip(self.thinking_enabled, "When enabled, the prompt asks the model to reason according to the selected effort level. Turn off for direct answers.")
-        self.reasoning_effort = QComboBox()
-        self.reasoning_effort.addItems(["Balanced", "Fast", "Deep"])
-        self.reasoning_effort.setMaximumWidth(260)
-        self._tip(self.reasoning_effort, "Controls the instruction style sent with each prompt. Deep asks for more careful reasoning.")
-        self.thinking_enabled.toggled.connect(self.reasoning_effort.setEnabled)
-        self.chat_max_tokens = self._spin(16, 8192, 512)
-        self._tip(self.chat_max_tokens, "Maximum new tokens for each assistant reply.")
-        self.chat_temperature = self._double_spin(0.0, 2.0, 0.7, 0.05, 2)
-        self._tip(self.chat_temperature, "Sampling randomness. Lower is more focused; higher is more creative.")
-        self.chat_top_p = self._double_spin(0.01, 1.0, 0.9, 0.01, 2)
-        self._tip(self.chat_top_p, "Nucleus sampling. Lower values restrict the model to more likely tokens.")
-        self.chat_repeat_penalty = self._double_spin(0.8, 2.0, 1.1, 0.01, 2)
-        self._tip(self.chat_repeat_penalty, "Penalty for repeated text. Higher can reduce loops.")
-        sample_form.addRow("", self.thinking_enabled)
-        sample_form.addRow("Reasoning effort", self.reasoning_effort)
-        sample_form.addRow("Max tokens", self.chat_max_tokens)
-        sample_form.addRow("Temperature", self.chat_temperature)
-        sample_form.addRow("Top-p", self.chat_top_p)
-        sample_form.addRow("Repeat penalty", self.chat_repeat_penalty)
-
-        self.system_prompt = QTextEdit()
-        self.system_prompt.setObjectName("SystemPrompt")
-        self.system_prompt.setMaximumHeight(120)
-        self.system_prompt.setPlaceholderText("Optional system prompt")
-        self._tip(self.system_prompt, "Optional behavior instruction sent to the model with each message.")
-        system_layout = QVBoxLayout()
-        system_layout.addWidget(self.system_prompt)
-
-        settings_column.addWidget(self._card("MODEL LOADER", model_form))
-        settings_column.addWidget(self._card("RESPONSE TUNING", sample_form))
-        settings_column.addWidget(self._card("SYSTEM PROMPT", system_layout))
-        settings_column.addStretch(1)
-
-        main.addLayout(chat_column, 1)
-        main.addWidget(settings_panel)
-        layout.addLayout(main, 1)
-
-        self.chat_progress = self._thin_progress()
-        layout.addWidget(self.chat_progress)
-        return page
+        return build_chat_tab(self)
 
     def _panel(self) -> QWidget:
         """Create a base page panel.
@@ -1272,6 +587,47 @@ class MainWindow(QMainWindow):
         self._tip(label, tooltip)
         return label
 
+    def _hardware_meter(self, name: str) -> QProgressBar:
+        """Create a slider-like hardware utilization meter.
+
+        Args:
+            name: Display name for the meter.
+
+        Returns:
+            Configured progress bar.
+        """
+
+        meter = QProgressBar()
+        meter.setObjectName("HardwareMeter")
+        meter.setRange(0, 100)
+        meter.setValue(0)
+        meter.setTextVisible(False)
+        meter.setFixedHeight(8)
+        meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tip(meter, f"Live {name} utilization.")
+        return meter
+
+    def _set_meter(self, meter: QProgressBar, name: str, value: Optional[float]) -> None:
+        """Update a hardware utilization meter.
+
+        Args:
+            meter: Meter to update.
+            name: Display name for the meter.
+            value: Utilization percentage.
+        """
+
+        if value is None:
+            meter.setValue(0)
+            label = self.hardware_meter_labels.get(id(meter))
+            if label is not None:
+                label.setText(f"{name}: -")
+            return
+        bounded = max(0.0, min(100.0, float(value)))
+        meter.setValue(int(round(bounded)))
+        label = self.hardware_meter_labels.get(id(meter))
+        if label is not None:
+            label.setText(f"{name}: {bounded:.1f}%")
+
     def _update_dataset_quality_report(self, summary: dict[str, Any]) -> None:
         """Update dataset quality chips from a summary dictionary.
 
@@ -1294,6 +650,8 @@ class MainWindow(QMainWindow):
         self.dataset_quality_tokens.setText(f"Tokens: {token_count:,}")
         self.dataset_quality_vocab.setText(f"Vocab: {vocab_size:,}" if vocab_size else "Vocab: -")
         self.dataset_quality_code.setText(f"Code/prose: {code_count:,}/{prose_count:,}")
+        self.dataset_quality_balance.setText("Balance: prepared")
+        self.dataset_quality_readiness.setText("Readiness: preview needed")
         self.dataset_quality_cache.setText(f"Files: {processed_count:,} ok, {cached_count:,} cached, {skipped_count:,} skipped, {failed_count:,} failed")
         self.dataset_quality_warning.setText(f"Warnings: {warning}")
         self._tip(self.dataset_quality_samples, f"{character_count:,} source characters across prepared samples.")
@@ -1305,8 +663,14 @@ class MainWindow(QMainWindow):
         self.dataset_quality_tokens.setText("Tokens: -")
         self.dataset_quality_vocab.setText("Vocab: -")
         self.dataset_quality_code.setText("Code/prose: -")
+        self.dataset_quality_balance.setText("Balance: -")
+        self.dataset_quality_readiness.setText("Readiness: -")
         self.dataset_quality_cache.setText("Cache: -")
+        self.dataset_quality_duplicates.setText("Duplicates: -")
+        self.dataset_quality_extraction.setText("Extraction: -")
         self.dataset_quality_warning.setText("Warnings: none")
+        if hasattr(self, "dataset_advisor"):
+            self.dataset_advisor.setPlainText("Run Preview Dataset to get cleanup suggestions.")
 
     def _card(self, title: str, content_layout: Union[QVBoxLayout, QFormLayout, QGridLayout, QHBoxLayout]) -> QWidget:
         """Create a neon module card.
@@ -1468,405 +832,6 @@ class MainWindow(QMainWindow):
             return
         self.current_assistant_message.set_content(markdown_text)
 
-    def _markdown_to_html(self, markdown_text: str) -> str:
-        """Convert Markdown to themed HTML.
-
-        Args:
-            markdown_text: Markdown content.
-
-        Returns:
-            HTML suitable for a chat bubble.
-        """
-
-        try:
-            import markdown as markdown_lib
-            from pygments import highlight
-            from pygments.formatters import HtmlFormatter
-            from pygments.lexers import TextLexer, get_lexer_by_name, guess_lexer
-
-            markdown_text = self._normalize_code_blocks(markdown_text)
-            body_parts: list[str] = []
-            pattern = re.compile(r"```(?P<lang>[\w+-]*)\n(?P<code>.*?)```", re.DOTALL)
-            last = 0
-            formatter = HtmlFormatter(style="monokai", noclasses=True, nowrap=True)
-            for match in pattern.finditer(markdown_text):
-                prose = markdown_text[last:match.start()]
-                if prose.strip():
-                    body_parts.append(markdown_lib.markdown(prose, extensions=["tables", "nl2br"]))
-                code = match.group("code")
-                lang = match.group("lang").strip()
-                try:
-                    lexer = get_lexer_by_name(lang) if lang else guess_lexer(code)
-                except Exception:
-                    lexer = TextLexer()
-                highlighted = highlight(code, lexer, formatter)
-                label = lang.title() if lang else lexer.name
-                body_parts.append(self._code_block_html(label, highlighted, code))
-                last = match.end()
-            prose = markdown_text[last:]
-            if prose.strip():
-                body_parts.append(markdown_lib.markdown(prose, extensions=["tables", "nl2br"]))
-            body = "\n".join(body_parts) if body_parts else ""
-            return (
-                f"""<!doctype html>
-                <html>
-                <head>
-                <style>
-                body {{
-                    background: transparent;
-                    color: #eeeeee;
-                    font-family: Arial, "Segoe UI", sans-serif;
-                    font-size: 14px;
-                    line-height: 1.22;
-                    margin: 0;
-                }}
-                h1 {{ color: #f2f2f2; font-size: 19px; margin: 6px 0 3px 0; }}
-                h2 {{ color: #f2f2f2; font-size: 17px; margin: 6px 0 3px 0; }}
-                h3 {{ color: #f2f2f2; font-size: 15px; margin: 5px 0 2px 0; }}
-                p {{ margin: 2px 0; }}
-                ol, ul {{ margin-top: 2px; margin-bottom: 2px; padding-left: 20px; }}
-                li {{ margin: 1px 0; }}
-                code {{
-                    background: #1a1a1a;
-                    color: #d4d4d4;
-                    border-radius: 4px;
-                    padding: 2px 4px;
-                    font-family: Consolas, monospace;
-                }}
-                pre {{
-                    background: transparent;
-                    border: 0;
-                    border-radius: 0;
-                    padding: 0;
-                    margin: 4px 0;
-                    overflow: auto;
-                    white-space: pre-wrap;
-                }}
-                pre code {{
-                    background: transparent;
-                    padding: 0;
-                    color: #d4d4d4;
-                    font-family: Consolas, monospace;
-                    font-size: 13px;
-                    line-height: 1.16;
-                }}
-                blockquote {{
-                    border-left: 3px solid #f5b041;
-                    margin-left: 0;
-                    padding-left: 12px;
-                    color: #cccccc;
-                }}
-                table {{ border-collapse: collapse; }}
-                th, td {{ border: 1px solid #555555; padding: 6px 8px; }}
-                .codeblock {{
-                    background: #050505;
-                    border: 1px solid #2b2b2b;
-                    border-radius: 12px;
-                    margin: 8px 0;
-                }}
-                .codebar {{
-                    color: #f2f2f2;
-                    background: #111111;
-                    border-bottom: 1px solid #2b2b2b;
-                    padding: 7px 10px;
-                    font-size: 12px;
-                    font-weight: bold;
-                }}
-                .copylink {{
-                    color: #d7d7d7;
-                    text-decoration: none;
-                    float: right;
-                    font-weight: normal;
-                }}
-                .codebody {{ padding: 12px 14px; }}
-                </style>
-                </head>
-                <body>{body}</body>
-                </html>
-                """
-            )
-        except Exception:
-            return self._basic_markdown_html(markdown_text)
-
-    def _basic_markdown_html(self, markdown_text: str) -> str:
-        """Render basic Markdown with simple code coloring.
-
-        Args:
-            markdown_text: Raw Markdown.
-
-        Returns:
-            Basic HTML.
-        """
-
-        text = self._normalize_code_blocks(markdown_text)
-        parts: list[str] = []
-        pattern = re.compile(r"```(?:\w+)?\n(.*?)```", re.DOTALL)
-        last = 0
-        for match in pattern.finditer(text):
-            parts.append(self._render_basic_prose(text[last:match.start()]))
-            code = match.group(1)
-            parts.append(self._code_block_html("Code", self._colorize_code(code), code))
-            last = match.end()
-        parts.append(self._render_basic_prose(text[last:]))
-        return (
-            "<html><body style='background:transparent;color:#eeeeee;font-family:Arial;font-size:14px;line-height:1.22;'>"
-            "<style>"
-            "p{margin:2px 0;} h1{font-size:19px;margin:6px 0 3px;} h2{font-size:17px;margin:6px 0 3px;}"
-            "h3{font-size:15px;margin:5px 0 2px;} ol,ul{margin-top:2px;margin-bottom:2px;padding-left:20px;} li{margin:1px 0;}"
-            "code{background:#1a1a1a;color:#d4d4d4;border-radius:4px;padding:2px 4px;font-family:Consolas,monospace;}"
-            "pre{background:transparent;border:0;border-radius:0;padding:0;margin:4px 0;"
-            "font-family:Consolas,monospace;white-space:pre-wrap;line-height:1.16;font-size:13px;}"
-            ".codeblock{background:#050505;border:1px solid #2b2b2b;border-radius:12px;margin:8px 0;}"
-            ".codebar{color:#f2f2f2;background:#111;border-bottom:1px solid #2b2b2b;padding:7px 10px;font-size:12px;font-weight:bold;}"
-            ".copylink{color:#d7d7d7;text-decoration:none;float:right;font-weight:normal;}.codebody{padding:12px 14px;}"
-            "</style>"
-            + "".join(parts)
-            + "</body></html>"
-        )
-
-    def _code_block_html(self, label: str, highlighted_html: str, raw_code: str) -> str:
-        """Build a code panel with a copy link.
-
-        Args:
-            label: Code language label.
-            highlighted_html: Highlighted code HTML.
-            raw_code: Raw code for clipboard copy.
-
-        Returns:
-            Code panel HTML.
-        """
-
-        return (
-            "<div class='codeblock'>"
-            f"<div class='codebar'>{self._escape_html(label or 'Code')}"
-            f"<a class='copylink' href='copycode:{quote(raw_code)}'>⧉ Copy</a></div>"
-            f"<div class='codebody'><pre><code>{highlighted_html}</code></pre></div>"
-            "</div>"
-        )
-
-    def _render_basic_prose(self, text: str) -> str:
-        """Render a small Markdown subset for fallback mode.
-
-        Args:
-            text: Markdown prose.
-
-        Returns:
-            HTML fragment.
-        """
-
-        html_lines: list[str] = []
-        in_ordered = False
-        in_unordered = False
-
-        def close_lists() -> None:
-            nonlocal in_ordered, in_unordered
-            if in_ordered:
-                html_lines.append("</ol>")
-                in_ordered = False
-            if in_unordered:
-                html_lines.append("</ul>")
-                in_unordered = False
-
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                close_lists()
-                html_lines.append("<br>")
-                continue
-            if line.startswith("### "):
-                close_lists()
-                html_lines.append(f"<h3>{self._inline_basic_markdown(line[4:])}</h3>")
-                continue
-            if line.startswith("## "):
-                close_lists()
-                html_lines.append(f"<h2>{self._inline_basic_markdown(line[3:])}</h2>")
-                continue
-            if line.startswith("# "):
-                close_lists()
-                html_lines.append(f"<h1>{self._inline_basic_markdown(line[2:])}</h1>")
-                continue
-            ordered = re.match(r"^\d+\.\s+(.*)$", line)
-            if ordered:
-                if not in_ordered:
-                    close_lists()
-                    html_lines.append("<ol>")
-                    in_ordered = True
-                html_lines.append(f"<li>{self._inline_basic_markdown(ordered.group(1))}</li>")
-                continue
-            unordered = re.match(r"^[-*]\s+(.*)$", line)
-            if unordered:
-                if not in_unordered:
-                    close_lists()
-                    html_lines.append("<ul>")
-                    in_unordered = True
-                html_lines.append(f"<li>{self._inline_basic_markdown(unordered.group(1))}</li>")
-                continue
-            close_lists()
-            html_lines.append(f"<p>{self._inline_basic_markdown(line)}</p>")
-        close_lists()
-        return "\n".join(html_lines)
-
-    def _inline_basic_markdown(self, text: str) -> str:
-        """Render inline Markdown for fallback mode.
-
-        Args:
-            text: Inline Markdown text.
-
-        Returns:
-            HTML fragment.
-        """
-
-        escaped = self._escape_html(text)
-        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-        escaped = re.sub(r"\*(.+?)\*", r"<em>\1</em>", escaped)
-        return escaped
-
-    @staticmethod
-    def _escape_html(text: str) -> str:
-        """Escape text for HTML.
-
-        Args:
-            text: Raw text.
-
-        Returns:
-            Escaped text.
-        """
-
-        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    def _colorize_code(self, code: str) -> str:
-        """Apply simple inline colors to Python-like code.
-
-        Args:
-            code: Source code.
-
-        Returns:
-            HTML code.
-        """
-
-        escaped = self._escape_html(code)
-        keywords = {
-            "def", "class", "import", "from", "for", "while", "if", "else", "elif",
-            "try", "except", "return", "print", "with", "as", "in", "function", "const",
-            "let", "var", "new", "typeof", "await", "async", "true", "false", "null",
-            "True", "False", "None",
-        }
-        builtins = {"console", "Object", "process", "JSON", "Array", "String", "Number", "Boolean", "Math", "os", "sys"}
-        token_pattern = re.compile(
-            r"(?P<comment>//.*|#.*)"
-            r"|(?P<string>`(?:\\.|[^`])*`|'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\")"
-            r"|(?P<number>\b\d+(?:\.\d+)?\b)"
-            r"|(?P<word>\b[A-Za-z_][A-Za-z0-9_]*\b)"
-        )
-        colored_lines: list[str] = []
-        for line in escaped.splitlines():
-            segments: list[str] = []
-            last = 0
-            for match in token_pattern.finditer(line):
-                segments.append(line[last:match.start()])
-                value = match.group(0)
-                if match.lastgroup == "comment":
-                    segments.append(f"<span style='color:#6a9955;'>{value}</span>")
-                elif match.lastgroup == "string":
-                    segments.append(f"<span style='color:#ce9178;'>{value}</span>")
-                elif match.lastgroup == "number":
-                    segments.append(f"<span style='color:#b5cea8;'>{value}</span>")
-                elif match.lastgroup == "word":
-                    next_chars = line[match.end(): match.end() + 2]
-                    previous = line[max(0, match.start() - 1): match.start()]
-                    if value in keywords:
-                        segments.append(f"<span style='color:#569cd6;font-weight:bold;'>{value}</span>")
-                    elif value in builtins:
-                        segments.append(f"<span style='color:#4ec9b0;'>{value}</span>")
-                    elif next_chars.startswith("(") and previous != ".":
-                        segments.append(f"<span style='color:#dcdcaa;'>{value}</span>")
-                    elif previous == ".":
-                        segments.append(f"<span style='color:#9cdcfe;'>{value}</span>")
-                    else:
-                        segments.append(value)
-                last = match.end()
-            segments.append(line[last:])
-            colored_lines.append("".join(segments))
-        return "\n".join(colored_lines)
-
-    def _normalize_code_blocks(self, markdown_text: str) -> str:
-        """Fence obvious loose code blocks so syntax highlighting can run.
-
-        Args:
-            markdown_text: Raw model Markdown.
-
-        Returns:
-            Markdown with likely code blocks fenced.
-        """
-
-        if "```" in markdown_text:
-            if markdown_text.count("```") % 2:
-                return f"{markdown_text}\n```"
-            return markdown_text
-        lines = markdown_text.splitlines()
-        normalized: list[str] = []
-        code_block: list[str] = []
-
-        def is_code_line(line: str) -> bool:
-            stripped = line.strip()
-            if not stripped:
-                return bool(code_block)
-            if line.startswith(("    ", "\t")):
-                return True
-            if re.match(
-                r"^(def|class|import|from|for|while|if|else:?|elif|try:?|except|return|print|with|"
-                r"function|const|let|var|console\.|Object\.|process\.)\b",
-                stripped,
-            ):
-                return True
-            if stripped in {"{", "}", "};", "})", "});"}:
-                return True
-            if stripped.startswith(("#", "@")):
-                return True
-            return sum(stripped.count(symbol) for symbol in "()[]{}:=<>+-*/") >= 3
-
-        def flush() -> None:
-            nonlocal code_block
-            if len([line for line in code_block if line.strip()]) >= 3:
-                normalized.append(f"```{self._guess_code_language(code_block)}")
-                normalized.extend(code_block)
-                normalized.append("```")
-            else:
-                normalized.extend(code_block)
-            code_block = []
-
-        for line in lines:
-            if is_code_line(line):
-                code_block.append(line)
-            else:
-                flush()
-                normalized.append(line)
-        flush()
-        return "\n".join(normalized)
-
-    @staticmethod
-    def _guess_code_language(lines: list[str]) -> str:
-        """Guess a fence language for loose code.
-
-        Args:
-            lines: Code lines.
-
-        Returns:
-            Markdown fence language.
-        """
-
-        joined = "\n".join(lines).lower()
-        if any(marker in joined for marker in ("console.", "const ", "let ", "function ", "process.env", "object.keys")):
-            return "javascript"
-        if any(marker in joined for marker in ("#include", "std::", "cout", "cin")):
-            return "cpp"
-        if any(marker in joined for marker in ("public class", "system.out", "private ", "protected ")):
-            return "java"
-        if any(marker in joined for marker in ("def ", "import ", "print(", "self.")):
-            return "python"
-        return "text"
-
     def _add_chat_message(
         self,
         role: str,
@@ -1891,7 +856,7 @@ class MainWindow(QMainWindow):
         message = ChatMessageWidget(
             role,
             content,
-            self._markdown_to_html,
+            markdown_to_html,
             self._resend_chat_message,
             metrics=metrics,
             resend_prompt=resend_prompt,
@@ -2084,11 +1049,16 @@ class MainWindow(QMainWindow):
             project_file = self.current_project_file
             project_dir = project_file.parent
         project_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_project_workspace(project_dir)
+        if self.current_project_file is None:
+            self._apply_project_workspace_paths(project_dir)
         project_file.write_text(json.dumps(self._project_state_dict(project_name, project_dir), indent=2), encoding="utf-8")
         self.current_project_file = project_file
+        self._apply_project_runtime_environment(project_dir)
         self.project_state.setText("Project saved")
         if self.current_project_file == project_file:
             self.dataset_log.append(f"Project saved: {project_file}")
+            self.dataset_log.append(f"Project workspace: {project_dir}")
 
     def new_project(self) -> None:
         """Start a fresh project and clear the active project file binding."""
@@ -2134,8 +1104,57 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open failed", f"Could not open project:\n{exc}")
             return
         self.current_project_file = Path(project_file)
+        self._ensure_project_workspace(self.current_project_file.parent)
+        self._apply_project_runtime_environment(self.current_project_file.parent)
+        if self.model_dir.text().strip():
+            self._load_existing_telemetry(Path(self.model_dir.text()))
         self.project_state.setText("Project opened")
         self.dataset_log.append(f"Opened project: {project_file}")
+        self.refresh_model_estimate()
+
+    def _ensure_project_workspace(self, project_dir: Path) -> None:
+        """Create standard folders inside a project.
+
+        Args:
+            project_dir: Project root folder.
+        """
+
+        for name in ("datasets", "models", "exports", "cache", "temp"):
+            (project_dir / name).mkdir(parents=True, exist_ok=True)
+
+    def _apply_project_workspace_paths(self, project_dir: Path) -> None:
+        """Point project output fields at the standard project folders.
+
+        Args:
+            project_dir: Project root folder.
+        """
+
+        dataset_dir = project_dir / "datasets"
+        model_dir = project_dir / "models"
+        export_dir = project_dir / "exports"
+        self.dataset_dir.setText(str(dataset_dir))
+        self.train_data_dir.setText(str(dataset_dir))
+        self.model_dir.setText(str(model_dir))
+        self.export_model_dir.setText(str(model_dir))
+        self.export_dir.setText(str(export_dir))
+        self.gguf_output_path.setText(str(export_dir / "model.gguf"))
+
+    def _apply_project_runtime_environment(self, project_dir: Path) -> None:
+        """Prefer project-local cache/temp folders for runtime work.
+
+        Args:
+            project_dir: Project root folder.
+        """
+
+        cache_dir = project_dir / "cache"
+        temp_dir = project_dir / "temp"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            os.environ[key] = str(temp_dir)
+        for key in ("TORCH_HOME", "HF_HOME", "TRANSFORMERS_CACHE", "PYTORCH_KERNEL_CACHE"):
+            os.environ[key] = str(cache_dir / key.lower())
+            Path(os.environ[key]).mkdir(parents=True, exist_ok=True)
 
     def _default_project_state(self) -> dict[str, Any]:
         """Build the default state used for a newly created project.
@@ -2199,7 +1218,9 @@ class MainWindow(QMainWindow):
                 "gradient_accumulation": 1,
                 "warmup_steps": 100,
                 "eval_interval": 100,
+                "max_eval_batches": 50,
                 "save_interval": 500,
+                "data_loader_workers": 0,
                 "max_grad_norm": 1.0,
                 "seed": 1337,
                 "device": self.device.currentText(),
@@ -2269,11 +1290,32 @@ class MainWindow(QMainWindow):
         self.training_grad_metric.setText("Grad: -")
         self.training_vram_metric.setText("VRAM: -")
         self.training_eta_metric.setText("ETA: -")
+        self.history_metric.setText(f"Runs: {len(self._load_training_history())}")
         self.loss_chart.clear()
         self.optimization_chart.clear()
         self.stability_chart.clear()
         self.throughput_chart.clear()
         self.memory_chart.clear()
+        self.live_prediction_chart.update_distribution(0, None)
+        self.live_attention_chart.update_heatmap(0, None)
+        self.live_activation_chart.update_histogram(0, None)
+        self.live_gradient_chart.update_flow(self.n_layer.value(), None, 0)
+        self.live_sample_text.setText("Training text: -")
+        self.telemetry_db_path = None
+        self.telemetry_run_id = ""
+        self.telemetry_latest_id = 0
+        self.telemetry_latest_index = 0
+        self.live_scrub_active = False
+        self.live_time_slider.blockSignals(True)
+        self.live_time_slider.setRange(0, 0)
+        self.live_time_slider.setValue(0)
+        self.live_time_slider.blockSignals(False)
+        self.live_timeline_label.setText("Timeline: no saved telemetry")
+        self._set_meter(self.live_cpu_bar, "CPU", self._system_cpu_value())
+        self._set_meter(self.live_gpu_bar, "GPU memory", None)
+        self._set_meter(self.live_vram_bar, "VRAM reserved", None)
+        self._set_meter(self.live_ram_bar, "System RAM", self._system_ram_value())
+        self.live_worker_status.setText(f"CPU workers: {self.data_loader_workers.value()}")
         self._clear_chat_messages()
         self.chat_markdown = ""
         self.chat_stream_prefix = ""
@@ -2337,6 +1379,10 @@ class MainWindow(QMainWindow):
                 "architecture_style": self.architecture_style.currentText(),
                 "n_embd": self.n_embd.value(),
                 "n_head": self.n_head.value(),
+                "attention_type": self._attention_type_value(),
+                "kv_head_count": self.kv_head_count.value(),
+                "attention_backend": self._attention_backend_value(),
+                "attention_window": self.attention_window.value(),
                 "n_layer": self.n_layer.value(),
                 "context_length": self.train_context_length.value(),
                 "dropout": self.dropout.value(),
@@ -2344,14 +1390,21 @@ class MainWindow(QMainWindow):
                 "batch_size": self.batch_size.value(),
                 "learning_rate": self.learning_rate.value(),
                 "weight_decay": self.weight_decay.value(),
+                "optimizer_name": self._optimizer_value(),
+                "scheduler_name": self._scheduler_value(),
+                "scheduler_min_lr_ratio": self.min_lr_ratio.value(),
+                "polynomial_power": self.polynomial_power.value(),
                 "gradient_accumulation": self.gradient_accumulation.value(),
                 "warmup_steps": self.warmup_steps.value(),
                 "eval_interval": self.eval_interval.value(),
+                "max_eval_batches": self.max_eval_batches.value(),
                 "save_interval": self.save_interval.value(),
+                "data_loader_workers": self.data_loader_workers.value(),
                 "max_grad_norm": self.max_grad_norm.value(),
                 "seed": self.seed.value(),
                 "device": self.device.currentText(),
                 "use_amp": self.use_amp.isChecked(),
+                "precision": self._precision_value(),
                 "resume": self.resume_training.isChecked(),
                 "require_compatible_resume": self.resume_safety.isChecked(),
                 "benchmark_prompts": self.benchmark_prompts.toPlainText(),
@@ -2442,6 +1495,17 @@ class MainWindow(QMainWindow):
         self._set_combo_text(self.architecture_style, str(training.get("architecture_style", self.architecture_style.currentText())))
         self.n_embd.setValue(int(training.get("n_embd", self.n_embd.value())))
         self.n_head.setValue(int(training.get("n_head", self.n_head.value())))
+        self._set_combo_by_data(self.attention_type, str(training.get("attention_type", "mha")), {
+            "mha": "Multi-head",
+            "gqa": "Grouped-query",
+            "mqa": "Multi-query",
+        })
+        self.kv_head_count.setValue(int(training.get("kv_head_count", self.kv_head_count.value())))
+        self._set_combo_by_data(self.attention_backend, str(training.get("attention_backend", "sdpa")), {
+            "sdpa": "SDPA / Flash when available",
+            "manual": "Manual",
+        })
+        self.attention_window.setValue(int(training.get("attention_window", self.attention_window.value())))
         self.n_layer.setValue(int(training.get("n_layer", self.n_layer.value())))
         self.train_context_length.setValue(int(training.get("context_length", self.train_context_length.value())))
         self.dropout.setValue(float(training.get("dropout", self.dropout.value())))
@@ -2449,14 +1513,36 @@ class MainWindow(QMainWindow):
         self.batch_size.setValue(int(training.get("batch_size", self.batch_size.value())))
         self.learning_rate.setValue(float(training.get("learning_rate", self.learning_rate.value())))
         self.weight_decay.setValue(float(training.get("weight_decay", self.weight_decay.value())))
+        self._set_combo_by_data(self.optimizer_name, str(training.get("optimizer_name", "adamw")), {
+            "adamw": "AdamW",
+            "adam": "Adam",
+            "lion": "Lion",
+            "adafactor": "Adafactor",
+        })
+        self._set_combo_by_data(self.scheduler_name, str(training.get("scheduler_name", "warmup_linear")), {
+            "warmup_linear": "Warmup linear",
+            "cosine": "Cosine decay",
+            "polynomial": "Polynomial decay",
+            "one_cycle": "One-cycle",
+            "constant": "Constant",
+        })
+        self.min_lr_ratio.setValue(float(training.get("scheduler_min_lr_ratio", self.min_lr_ratio.value())))
+        self.polynomial_power.setValue(float(training.get("polynomial_power", self.polynomial_power.value())))
         self.gradient_accumulation.setValue(int(training.get("gradient_accumulation", self.gradient_accumulation.value())))
         self.warmup_steps.setValue(int(training.get("warmup_steps", self.warmup_steps.value())))
         self.eval_interval.setValue(int(training.get("eval_interval", self.eval_interval.value())))
+        self.max_eval_batches.setValue(int(training.get("max_eval_batches", self.max_eval_batches.value())))
         self.save_interval.setValue(int(training.get("save_interval", self.save_interval.value())))
+        self.data_loader_workers.setValue(int(training.get("data_loader_workers", self.data_loader_workers.value())))
         self.max_grad_norm.setValue(float(training.get("max_grad_norm", self.max_grad_norm.value())))
         self.seed.setValue(int(training.get("seed", self.seed.value())))
         self._set_combo_text(self.device, str(training.get("device", self.device.currentText())))
         self.use_amp.setChecked(bool(training.get("use_amp", self.use_amp.isChecked())))
+        self._set_combo_by_data(self.precision, str(training.get("precision", "fp16")), {
+            "fp16": "FP16",
+            "bf16": "BF16",
+            "fp32": "FP32",
+        })
         self.resume_training.setChecked(bool(training.get("resume", self.resume_training.isChecked())))
         self.resume_safety.setChecked(bool(training.get("require_compatible_resume", True)))
         self.benchmark_prompts.setPlainText(str(training.get("benchmark_prompts", self.benchmark_prompts.toPlainText())))
@@ -2718,8 +1804,12 @@ class MainWindow(QMainWindow):
                 self._update_training_metrics(event)
             if message:
                 log.append(str(message))
+                if log is self.training_log and hasattr(self, "live_log"):
+                    self.live_log.append(str(message))
             if percent is not None:
                 progress_bar.setValue(max(0, min(100, int(percent))))
+                if log is self.training_log and hasattr(self, "live_progress"):
+                    self.live_progress.setValue(max(0, min(100, int(percent))))
         else:
             log.append(str(event))
 
@@ -2746,6 +1836,7 @@ class MainWindow(QMainWindow):
         if step is None:
             return
         step_int = int(step)
+        self._record_live_metric(event)
         learning_rate = event.get("learning_rate")
         grad_norm = event.get("grad_norm")
         weight_norm = event.get("weight_norm")
@@ -2754,6 +1845,10 @@ class MainWindow(QMainWindow):
         samples_per_second = event.get("samples_per_second")
         vram_allocated = event.get("vram_allocated_gb")
         vram_reserved = event.get("vram_reserved_gb")
+        gpu_memory = event.get("gpu_memory_percent")
+        system_cpu = event.get("system_cpu_percent")
+        system_ram = event.get("system_ram_percent")
+        data_workers = event.get("data_loader_workers")
         eta_seconds = event.get("eta_seconds")
         if learning_rate is not None:
             self.training_lr_metric.setText(f"LR: {float(learning_rate):.2e}")
@@ -2773,6 +1868,129 @@ class MainWindow(QMainWindow):
             self.throughput_chart.add_values(step_int, tokens_per_second, samples_per_second)
         if vram_allocated is not None or vram_reserved is not None:
             self.memory_chart.add_values(step_int, vram_allocated, vram_reserved)
+        if hasattr(self, "live_epoch_metric"):
+            self._update_live_training_metrics(
+                step_int,
+                event,
+                train_loss,
+                learning_rate,
+                grad_norm,
+                update_ratio,
+                tokens_per_second,
+                samples_per_second,
+                vram_allocated,
+                vram_reserved,
+                gpu_memory,
+                system_cpu,
+                system_ram,
+                data_workers,
+            )
+
+    def _update_live_training_metrics(
+        self,
+        step: int,
+        event: dict[str, Any],
+        train_loss: Optional[float],
+        learning_rate: Optional[float],
+        grad_norm: Optional[float],
+        update_ratio: Optional[float],
+        tokens_per_second: Optional[float],
+        samples_per_second: Optional[float],
+        vram_allocated: Optional[float],
+        vram_reserved: Optional[float],
+        gpu_memory: Optional[float],
+        system_cpu: Optional[float],
+        system_ram: Optional[float],
+        data_workers: Optional[int],
+    ) -> None:
+        """Update live tracker widgets from one training progress event.
+
+        Args:
+            step: Current optimizer step.
+            event: Progress event emitted by training.
+            train_loss: Latest training loss.
+            learning_rate: Current learning rate.
+            grad_norm: Current gradient norm.
+            update_ratio: Current parameter update ratio.
+            tokens_per_second: Current token throughput.
+            samples_per_second: Current sample throughput.
+            vram_allocated: Current CUDA allocated memory in GB.
+            vram_reserved: Current CUDA reserved memory in GB.
+            gpu_memory: Current GPU memory pressure percentage.
+            system_cpu: Current system CPU utilization percentage.
+            system_ram: Current system RAM utilization percentage.
+            data_workers: CPU data-loader worker count.
+        """
+
+        total_steps = event.get("total_steps")
+        if "epoch" in event and "total_epochs" in event:
+            self.live_epoch_metric.setText(f"Epoch: {event['epoch']}/{event['total_epochs']}")
+        if total_steps:
+            self.live_step_metric.setText(f"Step: {step:,}/{int(total_steps):,}")
+            data_percent = min(100.0, max(0.0, (step / max(1, int(total_steps))) * 100.0))
+            self.live_data_metric.setText(f"Data: {data_percent:.1f}%")
+            self.live_progress.setValue(int(data_percent))
+        else:
+            self.live_step_metric.setText(f"Step: {step:,}")
+        if tokens_per_second is not None:
+            self.live_tokens_metric.setText(f"Tokens/sec: {float(tokens_per_second):,.0f}")
+        if train_loss is not None:
+            self.live_loss_metric.setText(f"Loss: {float(train_loss):.4f}")
+        if learning_rate is not None:
+            self.live_lr_metric.setText(f"LR: {float(learning_rate):.2e}")
+        sample_text = str(event.get("sample_text") or "").strip()
+        if sample_text:
+            self.live_sample_text.setText(f"Training text: {self._compact_preview_text(sample_text, 220)}")
+        self.live_layer_status.setText(f"▣ Layers: {self.n_layer.value()}")
+        self.live_head_status.setText(f"◎ Heads: {self.n_head.value()}")
+        self.live_hidden_status.setText(f"▤ Hidden size: {self.n_embd.value()}")
+        self.live_batch_status.setText(f"▥ Batch size: {self.batch_size.value()}")
+        self.live_context_status.setText(f"▢ Context: {self.train_context_length.value()}")
+        self.live_device_status.setText(f"Device: {self.device.currentText()}")
+        self.live_worker_status.setText(f"CPU workers: {data_workers if data_workers is not None else self.data_loader_workers.value()}")
+        self._set_meter(self.live_cpu_bar, "CPU", system_cpu if system_cpu is not None else self._system_cpu_value())
+        self._set_meter(self.live_gpu_bar, "GPU memory", gpu_memory)
+        if vram_allocated is not None or vram_reserved is not None:
+            allocated = float(vram_allocated or 0.0)
+            reserved = float(vram_reserved or 0.0)
+            reserved_percent = None
+            if self.device.currentText().startswith("cuda") and torch.cuda.is_available():
+                try:
+                    _, total_vram = torch.cuda.mem_get_info()
+                    reserved_percent = min(100.0, 100.0 * reserved * (1024 ** 3) / max(total_vram, 1))
+                except Exception:
+                    reserved_percent = None
+            self._set_meter(self.live_vram_bar, "VRAM reserved", reserved_percent)
+            self.live_vram_label.setText(f"VRAM reserved: {reserved:.2f} GB ({allocated:.2f} GB active)")
+        self._set_meter(self.live_ram_bar, "System RAM", system_ram if system_ram is not None else self._system_ram_value())
+        latest_loss = float(train_loss) if train_loss is not None else None
+        self.live_flow.set_state(self.n_layer.value(), self.n_head.value(), step, latest_loss)
+        self.live_prediction_chart.update_distribution(step, latest_loss)
+        self.live_attention_chart.update_heatmap(step, grad_norm)
+        self.live_activation_chart.update_histogram(step, tokens_per_second)
+        self.live_gradient_chart.update_flow(self.n_layer.value(), grad_norm, step)
+
+    def _system_ram_value(self) -> Optional[float]:
+        """Read system RAM utilization for live telemetry.
+
+        Returns:
+            System RAM percentage, or None when unavailable.
+        """
+
+        if psutil is None:
+            return None
+        return float(psutil.virtual_memory().percent)
+
+    def _system_cpu_value(self) -> Optional[float]:
+        """Read system CPU utilization for live telemetry.
+
+        Returns:
+            System CPU percentage, or None when unavailable.
+        """
+
+        if psutil is None:
+            return None
+        return float(psutil.cpu_percent(interval=None))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -2844,7 +2062,11 @@ class MainWindow(QMainWindow):
         self.progress_queue = None
         self.active_log = None
         self.active_progress_bar = None
+        if self.active_stop_button is not None:
+            self.active_stop_button.setEnabled(False)
         self.active_stop_button = None
+        if self.active_button is not None:
+            self._clear_button_busy()
 
     def _task_failed(self, message: str, log: QTextEdit, progress_bar: QProgressBar) -> None:
         """Handle background task failure.
@@ -2855,10 +2077,11 @@ class MainWindow(QMainWindow):
             progress_bar: Progress bar to reset.
         """
 
-        log.append(f"Error: {message}")
+        stopped_by_user = "stopped by user" in message.lower()
+        log.append(f"Stopped: {message}" if stopped_by_user else f"Error: {message}")
         progress_bar.setRange(0, 100)
         progress_bar.setValue(0)
-        if "stopped by user" in message.lower():
+        if stopped_by_user:
             self.project_state.setText("Stopped")
         self._clear_button_busy()
 
@@ -2905,10 +2128,14 @@ class MainWindow(QMainWindow):
         self.spinner_index = (self.spinner_index + 1) % len(frames)
         self.active_button.setText(f"{frames[self.spinner_index]} {self.active_button_text}")
 
-    def prepare_dataset(self) -> None:
-        """Collect dataset options and start dataset preparation."""
+    def _dataset_config_from_ui(self) -> DatasetConfig:
+        """Collect dataset options from the current UI controls.
 
-        config = DatasetConfig(
+        Returns:
+            Dataset preparation configuration.
+        """
+
+        return DatasetConfig(
             input_dir=Path(self.input_dir.text()),
             output_dir=Path(self.dataset_dir.text()),
             vocab_size=None if self.auto_vocab.isChecked() else self.manual_vocab_size.value(),
@@ -2928,6 +2155,164 @@ class MainWindow(QMainWindow):
             tokenizer_strategy=self._tokenizer_strategy_value(),
             tokenizer_path=Path(self.tokenizer_path.text()) if self.tokenizer_path.text().strip() else None,
         )
+
+    def check_project_health(self) -> None:
+        """Run a project health check in the background."""
+
+        self.dataset_log.clear()
+        self.dataset_progress.setValue(0)
+        self.dataset_log.append("Checking project health...")
+        self.project_state.setText("Checking health")
+        self._run_task(
+            check_project_health,
+            (
+                Path(self.input_dir.text()),
+                Path(self.dataset_dir.text()),
+                Path(self.model_dir.text()),
+                Path(self.export_dir.text()),
+                Path(self.gguf_path.text()) if self.gguf_path.text().strip() else None,
+                Path(self.llama_cpp_dir.text()) if self.llama_cpp_dir.text().strip() else None,
+                self.device.currentText(),
+            ),
+            self._health_check_finished,
+            self.dataset_log,
+            self.dataset_progress,
+            with_progress=True,
+            button=self.health_check_button,
+            stop_button=self.stop_dataset_button,
+            busy_text="Checking Health",
+        )
+
+    @Slot(object)
+    def _health_check_finished(self, result: Any) -> None:
+        """Display project health check results.
+
+        Args:
+            result: Project health result.
+        """
+
+        self.dataset_progress.setValue(100)
+        self.dataset_log.append("")
+        self.dataset_log.append(f"Project health: {result.status.upper()} ({result.summary})")
+        for check in result.checks:
+            marker = {"ok": "OK", "warning": "WARN", "error": "ERROR"}.get(check.get("status"), "INFO")
+            self.dataset_log.append(f"[{marker}] {check.get('name')}: {check.get('detail')}")
+        self.project_state.setText("Health checked")
+        self._clear_button_busy("Check Health")
+
+    def preview_dataset(self) -> None:
+        """Run a dataset preview and quality scan in the background."""
+
+        self.dataset_log.clear()
+        self.dataset_progress.setValue(0)
+        self.dataset_log.append("Previewing dataset...")
+        self.project_state.setText("Previewing dataset")
+        self._run_task(
+            scan_dataset_preview,
+            (self._dataset_config_from_ui(),),
+            self._dataset_preview_finished,
+            self.dataset_log,
+            self.dataset_progress,
+            with_progress=True,
+            button=self.preview_dataset_button,
+            stop_button=self.stop_dataset_button,
+            busy_text="Previewing Dataset",
+        )
+
+    @Slot(object)
+    def _dataset_preview_finished(self, result: Any) -> None:
+        """Display dataset preview and quality scan results.
+
+        Args:
+            result: Dataset preview result.
+        """
+
+        self.dataset_progress.setValue(100)
+        suffix_text = ", ".join(f"{suffix}: {count}" for suffix, count in result.suffix_counts.items()) or "none"
+        self.dataset_log.append("")
+        self.dataset_log.append(f"Source files: {result.source_file_count:,}; size: {result.total_bytes / (1024 * 1024):.2f} MB")
+        self.dataset_log.append(f"File types: {suffix_text}")
+        self.dataset_log.append(f"Prepared dataset artifacts: {'found' if result.prepared else 'not complete'}")
+        self.dataset_log.append(f"Duplicate scan: {result.duplicate_count:,} file entries in {len(result.duplicate_groups):,} likely group(s).")
+        self.dataset_log.append(f"Bad extraction scan: {result.bad_extraction_count:,} suspicious file(s).")
+        self.dataset_log.append(f"Code/prose balance: {result.balance_label} ({result.code_preview_count:,}/{result.prose_preview_count:,}).")
+        self.dataset_log.append(f"Training readiness: {result.readiness_label} ({result.readiness_score}/100).")
+        for reason in result.readiness_reasons[:8]:
+            self.dataset_log.append(f"- {reason}")
+        self.dataset_quality_duplicates.setText(f"Duplicates: {result.duplicate_count:,}")
+        self.dataset_quality_extraction.setText(f"Extraction: {result.bad_extraction_count:,} flagged")
+        self.dataset_quality_balance.setText(f"Balance: {result.balance_label}")
+        self.dataset_quality_readiness.setText(f"Readiness: {result.readiness_label} {result.readiness_score}/100")
+        if result.summary:
+            self._update_dataset_quality_report(result.summary)
+            self.dataset_quality_duplicates.setText(f"Duplicates: {result.duplicate_count:,}")
+            self.dataset_quality_extraction.setText(f"Extraction: {result.bad_extraction_count:,} flagged")
+            self.dataset_quality_balance.setText(f"Balance: {result.balance_label}")
+            self.dataset_quality_readiness.setText(f"Readiness: {result.readiness_label} {result.readiness_score}/100")
+            tokens = int(result.summary.get("token_count", 0) or 0)
+            vocab = int(result.summary.get("tokenizer_vocab_size", 0) or 0)
+            self.dataset_log.append(f"Prepared summary: {tokens:,} tokens, vocab {vocab:,}.")
+        else:
+            self.dataset_quality_samples.setText(f"Samples: {len(result.sample_previews):,} previewed")
+            self.dataset_quality_tokens.setText("Tokens: not prepared")
+            self.dataset_quality_vocab.setText("Vocab: not prepared")
+            self.dataset_quality_code.setText(f"Code/prose: {result.code_preview_count:,}/{result.prose_preview_count:,}")
+            self.dataset_quality_cache.setText(f"Files: {result.source_file_count:,} source")
+        if result.duplicate_groups:
+            self.dataset_log.append("")
+            self.dataset_log.append("Likely duplicates:")
+            for group in result.duplicate_groups[:8]:
+                self.dataset_log.append(f"- {group.get('type')}: {group.get('count')} file(s)")
+                for path in group.get("files", [])[:4]:
+                    self.dataset_log.append(f"    {Path(path).name}")
+        if result.bad_extraction_files:
+            self.dataset_log.append("")
+            self.dataset_log.append("Suspicious extraction files:")
+            for item in result.bad_extraction_files[:12]:
+                self.dataset_log.append(f"- {Path(item.get('path', '')).name}: {item.get('reasons')}")
+        suggestions: list[str] = []
+        if result.duplicate_groups:
+            suggestions.append("Remove or move duplicate files before preparing the final dataset.")
+        if result.bad_extraction_files:
+            suggestions.append("Replace flagged PDFs with text/source versions, or remove files with bad extraction.")
+        if result.balance_label == "Prose heavy" and self.code_training_mode.isChecked():
+            suggestions.append("Add real source-code folders or enable source-file inclusion for a stronger coding model.")
+        if result.balance_label == "Code heavy":
+            suggestions.append("Add README/tutorial/prose explanations if you want the model to explain code well.")
+        if result.readiness_label in {"Needs cleanup", "Not ready"}:
+            suggestions.append("Run Preview Dataset again after cleanup and only train once readiness improves.")
+        if hasattr(self, "dataset_advisor"):
+            if suggestions:
+                self.dataset_advisor.setPlainText("\n".join(f"- {suggestion}" for suggestion in suggestions))
+            else:
+                self.dataset_advisor.setPlainText("No immediate cleanup suggestions. Dataset looks acceptable for the current preview.")
+        if suggestions:
+            self.dataset_log.append("")
+            self.dataset_log.append("Cleanup suggestions:")
+            for suggestion in suggestions:
+                self.dataset_log.append(f"- {suggestion}")
+        if result.issues:
+            self.dataset_quality_warning.setText(f"Warnings: {len(result.issues)}")
+            self.dataset_log.append("")
+            self.dataset_log.append("Quality notes:")
+            for issue in result.issues[:12]:
+                self.dataset_log.append(f"- {issue}")
+        else:
+            self.dataset_quality_warning.setText("Warnings: none")
+        if result.sample_previews:
+            self.dataset_log.append("")
+            self.dataset_log.append("Preview samples:")
+            for index, sample in enumerate(result.sample_previews, start=1):
+                label = sample.get("language") or sample.get("kind") or "text"
+                self.dataset_log.append(f"\n[{index}] {Path(sample.get('path', '')).name} ({label}, {sample.get('characters')} chars)")
+                self.dataset_log.append(sample.get("preview", "").replace("\n", "\n    ")[:1400])
+        self.project_state.setText("Dataset previewed")
+        self._clear_button_busy("Preview Dataset")
+
+    def prepare_dataset(self) -> None:
+        """Collect dataset options and start dataset preparation."""
+
+        config = self._dataset_config_from_ui()
         self.dataset_log.clear()
         self.dataset_progress.setValue(0)
         self._reset_dataset_quality_report()
@@ -2990,6 +2375,7 @@ class MainWindow(QMainWindow):
             self.dataset_status.setText(
                 f"Dataset: {result.code_sample_count:,} code, {result.prose_sample_count:,} prose, {result.token_count:,} tokens"
             )
+        self.refresh_model_estimate()
         self._clear_button_busy("DataSet Prepared")
 
     def _prepare_mode_value(self) -> str:
@@ -3057,6 +2443,73 @@ class MainWindow(QMainWindow):
             "rope_theta": 10000.0,
         }
 
+    def _optimizer_value(self) -> str:
+        """Return the selected optimizer identifier.
+
+        Returns:
+            Stable optimizer name used by the trainer.
+        """
+
+        return {
+            "AdamW": "adamw",
+            "Adam": "adam",
+            "Lion": "lion",
+            "Adafactor": "adafactor",
+        }.get(self.optimizer_name.currentText(), "adamw")
+
+    def _scheduler_value(self) -> str:
+        """Return the selected scheduler identifier.
+
+        Returns:
+            Stable scheduler name used by the trainer.
+        """
+
+        return {
+            "Warmup linear": "warmup_linear",
+            "Cosine decay": "cosine",
+            "Polynomial decay": "polynomial",
+            "One-cycle": "one_cycle",
+            "Constant": "constant",
+        }.get(self.scheduler_name.currentText(), "warmup_linear")
+
+    def _precision_value(self) -> str:
+        """Return the selected numeric precision identifier.
+
+        Returns:
+            Stable precision name used by the trainer.
+        """
+
+        return {
+            "FP16": "fp16",
+            "BF16": "bf16",
+            "FP32": "fp32",
+        }.get(self.precision.currentText(), "fp16")
+
+    def _attention_type_value(self) -> str:
+        """Return the selected attention layout identifier.
+
+        Returns:
+            Stable attention type used by the model.
+        """
+
+        return {
+            "Multi-head": "mha",
+            "Grouped-query": "gqa",
+            "Multi-query": "mqa",
+        }.get(self.attention_type.currentText(), "mha")
+
+    def _attention_backend_value(self) -> str:
+        """Return the selected attention backend identifier.
+
+        Returns:
+            Stable attention backend used by the model.
+        """
+
+        return {
+            "SDPA / Flash when available": "sdpa",
+            "Manual": "manual",
+        }.get(self.attention_backend.currentText(), "sdpa")
+
     def _tokenizer_strategy_reuses(self) -> bool:
         """Return whether current tokenizer strategy ignores vocabulary controls.
 
@@ -3078,6 +2531,281 @@ class MainWindow(QMainWindow):
         self.manual_vocab_size.setEnabled(not reuses_tokenizer and not self.auto_vocab.isChecked())
         self.min_frequency.setEnabled(not reuses_tokenizer)
 
+    def _update_model_estimate_chips(self, estimate: dict[str, Any]) -> None:
+        """Update model and VRAM estimate chips.
+
+        Args:
+            estimate: Estimate dictionary from the training planning service.
+        """
+
+        params = int(estimate.get("parameters", 0))
+        checkpoint_bytes = float(estimate.get("checkpoint_bytes", 0))
+        vram_bytes = float(estimate.get("vram_bytes", 0))
+        self.model_size_metric.setText(f"Model: {params / 1_000_000:.2f}M, ckpt {format_bytes(checkpoint_bytes)}")
+        self.vram_estimate_metric.setText(f"VRAM est: {format_bytes(vram_bytes)}")
+
+    def _training_history_path(self) -> Path:
+        """Return the training history path for the selected model folder.
+
+        Returns:
+            Path to ``training_history.json``.
+        """
+
+        return Path(self.model_dir.text()) / "training_history.json"
+
+    def _load_training_history(self) -> list[dict[str, Any]]:
+        """Load training run history.
+
+        Returns:
+            List of training run entries.
+        """
+
+        path = self._training_history_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def refresh_model_estimate(self) -> None:
+        """Refresh model size, rough VRAM, and run history widgets."""
+
+        model_config = ModelConfig(
+            vocab_size=1,
+            context_length=self.train_context_length.value(),
+            embedding_size=self.n_embd.value(),
+            head_count=self.n_head.value(),
+            layer_count=self.n_layer.value(),
+            dropout=self.dropout.value(),
+            attention_type=self._attention_type_value(),
+            kv_head_count=self.kv_head_count.value(),
+            attention_backend=self._attention_backend_value(),
+            attention_window=self.attention_window.value(),
+            **self._architecture_style_config(),
+        )
+        training_config = TrainingConfig(
+            output_dir=Path(self.model_dir.text()),
+            epochs=self.epochs.value(),
+            batch_size=self.batch_size.value(),
+            learning_rate=self.learning_rate.value(),
+            weight_decay=self.weight_decay.value(),
+            optimizer_name=self._optimizer_value(),
+            scheduler_name=self._scheduler_value(),
+            scheduler_min_lr_ratio=self.min_lr_ratio.value(),
+            polynomial_power=self.polynomial_power.value(),
+            gradient_accumulation=self.gradient_accumulation.value(),
+            warmup_steps=self.warmup_steps.value(),
+            eval_interval=self.eval_interval.value(),
+            max_eval_batches=self.max_eval_batches.value(),
+            save_interval=self.save_interval.value(),
+            data_loader_workers=self.data_loader_workers.value(),
+            max_grad_norm=self.max_grad_norm.value(),
+            device=self.device.currentText(),
+            use_amp=self.use_amp.isChecked(),
+            precision=self._precision_value(),
+            seed=self.seed.value(),
+            resume=self.resume_training.isChecked(),
+            require_compatible_resume=self.resume_safety.isChecked(),
+        )
+        data_dir = Path(self.train_data_dir.text())
+        train_tokens = max(model_config.context_length * training_config.batch_size, 1)
+        try:
+            summary_path = data_dir / "dataset_summary.json"
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
+                train_tokens = int(summary.get("train_token_count", summary.get("token_count", train_tokens)) or train_tokens)
+                if vocab_size > 0:
+                    model_config.vocab_size = vocab_size
+            elif (data_dir / "tokenizer.json").exists():
+                tokenizer_data = json.loads((data_dir / "tokenizer.json").read_text(encoding="utf-8"))
+                vocab = tokenizer_data.get("model", {}).get("vocab", {})
+                if vocab:
+                    model_config.vocab_size = len(vocab)
+        except Exception as exc:
+            self.training_log.append(f"[WARN] Could not refresh dataset-based estimate: {exc}")
+        estimate = estimate_training_resources(model_config, training_config, train_tokens)
+        self.last_training_estimate = estimate
+        self._update_model_estimate_chips(estimate)
+        self.history_metric.setText(f"Runs: {len(self._load_training_history())}")
+        self.training_log.append(
+            "Model estimate refreshed: "
+            f"{int(estimate['parameters']):,} params, "
+            f"checkpoint {format_bytes(float(estimate['checkpoint_bytes']))}, "
+            f"VRAM {format_bytes(float(estimate['vram_bytes']))}."
+        )
+
+    def _append_training_history(self, result: Any) -> None:
+        """Persist a training run entry to ``training_history.json``.
+
+        Args:
+            result: Training result object.
+        """
+
+        history_path = self._training_history_path()
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history = self._load_training_history()
+        summary = {}
+        try:
+            if Path(result.summary_path).exists():
+                summary = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
+        except Exception:
+            summary = {}
+        estimate = getattr(self, "last_training_estimate", {}) or {}
+        entry = {
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint_path": str(result.checkpoint_path),
+            "summary_path": str(result.summary_path),
+            "stopped": bool(getattr(result, "stopped", False)),
+            "final_train_loss": result.final_train_loss,
+            "final_val_loss": result.final_val_loss,
+            "dataset_dir": self.train_data_dir.text(),
+            "dataset_version": (summary.get("model_lineage") or {}).get("dataset_version"),
+            "training_run_id": summary.get("training_run_id"),
+            "parameters": estimate.get("parameters") or summary.get("parameters"),
+            "model_config": summary.get("model_config"),
+            "training_config": summary.get("training_config"),
+        }
+        history.append(entry)
+        history_path.write_text(json.dumps(history[-200:], indent=2), encoding="utf-8")
+        self.history_metric.setText(f"Runs: {len(history[-200:])}")
+        self.training_log.append(f"Training history updated: {history_path}")
+
+    def _run_training_preflight(self, model_config: ModelConfig, training_config: TrainingConfig) -> bool:
+        """Run pre-training checklist and disk-space guard.
+
+        Args:
+            model_config: Selected model architecture.
+            training_config: Selected training settings.
+
+        Returns:
+            True when training may continue.
+        """
+
+        data_dir = Path(self.train_data_dir.text())
+        output_dir = Path(self.model_dir.text())
+        errors: list[str] = []
+        warnings: list[str] = []
+        info: list[str] = []
+        required = ("tokenizer.json", "train_tokens.json", "val_tokens.json")
+        missing = [name for name in required if not (data_dir / name).exists()]
+        if not data_dir.exists():
+            errors.append(f"Dataset folder does not exist: {data_dir}")
+        elif missing:
+            errors.append(f"Dataset is not prepared. Missing: {', '.join(missing)}")
+        else:
+            info.append("Dataset artifacts found.")
+
+        vocab_size = 0
+        train_tokens = 0
+        val_tokens = 0
+        summary = {}
+        try:
+            summary_path = data_dir / "dataset_summary.json"
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            vocab_size = int(summary.get("tokenizer_vocab_size", 0) or 0)
+            if vocab_size <= 0:
+                tokenizer_data = json.loads((data_dir / "tokenizer.json").read_text(encoding="utf-8"))
+                vocab_size = len(tokenizer_data.get("model", {}).get("vocab", {}))
+            train_tokens = int(summary.get("train_token_count", 0) or 0)
+            val_tokens = int(summary.get("val_token_count", 0) or 0)
+            if train_tokens <= 0 and (data_dir / "train_tokens.json").exists():
+                train_tokens = len(json.loads((data_dir / "train_tokens.json").read_text(encoding="utf-8")))
+            if val_tokens <= 0 and (data_dir / "val_tokens.json").exists():
+                val_tokens = len(json.loads((data_dir / "val_tokens.json").read_text(encoding="utf-8")))
+        except Exception as exc:
+            warnings.append(f"Could not fully inspect dataset metadata: {exc}")
+
+        if vocab_size > 0:
+            model_config.vocab_size = vocab_size
+            info.append(f"Tokenizer vocab: {vocab_size:,}.")
+        elif not missing:
+            errors.append("Could not determine tokenizer vocabulary size.")
+        if train_tokens and train_tokens <= model_config.context_length:
+            errors.append("Training token count must be larger than context length.")
+        elif train_tokens:
+            info.append(f"Training tokens: {train_tokens:,}; validation tokens: {val_tokens:,}.")
+            if train_tokens < 50_000:
+                warnings.append("Training token count is very small; expect smoke-test quality.")
+
+        try:
+            model_config.validate()
+        except Exception as exc:
+            errors.append(f"Model architecture is invalid: {exc}")
+        try:
+            training_config.validate()
+        except Exception as exc:
+            errors.append(f"Training options are invalid: {exc}")
+
+        if training_config.device == "cuda" and not torch.cuda.is_available():
+            errors.append("CUDA is selected, but PyTorch cannot use CUDA on this machine.")
+        elif training_config.device == "cuda":
+            info.append(f"CUDA ready: {torch.cuda.get_device_name(0)}.")
+            if training_config.data_loader_workers > 0:
+                info.append(f"CPU-assisted batch loading enabled with {training_config.data_loader_workers} worker(s).")
+        else:
+            warnings.append("CPU training is selected. This can be very slow.")
+        if sys.platform.startswith("win") and training_config.data_loader_workers > 4:
+            warnings.append("High CPU worker counts can duplicate dataset memory on Windows. Start with 2-4 workers and increase carefully.")
+
+        if training_config.resume_from_checkpoint and not Path(training_config.resume_from_checkpoint).exists():
+            errors.append(f"Selected resume checkpoint does not exist: {training_config.resume_from_checkpoint}")
+        elif training_config.resume and not (output_dir / "checkpoints").exists():
+            info.append("Resume latest is enabled, but no checkpoint folder exists yet. A new run will start.")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        estimate = estimate_training_resources(model_config, training_config, train_tokens)
+        self.last_training_estimate = estimate
+        self._update_model_estimate_chips(estimate)
+        params = int(estimate["parameters"])
+        checkpoint_bytes = float(estimate["checkpoint_bytes"])
+        checkpoint_count = int(estimate["checkpoint_count"])
+        estimated_storage = float(estimate["estimated_storage"])
+        estimated_vram = float(estimate["vram_bytes"])
+        free_bytes = shutil.disk_usage(output_dir).free
+        info.append(f"Estimated parameters: {params:,}.")
+        info.append(f"Estimated checkpoint size: {format_bytes(checkpoint_bytes)}.")
+        info.append(f"Estimated training VRAM: {format_bytes(estimated_vram)}.")
+        info.append(f"Estimated training storage need: {format_bytes(estimated_storage)}.")
+        info.append(f"Free space on model drive: {format_bytes(free_bytes)}.")
+        if training_config.device == "cuda" and torch.cuda.is_available():
+            free_vram, total_vram = torch.cuda.mem_get_info()
+            info.append(f"GPU free/total VRAM: {format_bytes(free_vram)} / {format_bytes(total_vram)}.")
+            if estimated_vram > free_vram * 0.9:
+                warnings.append("Estimated VRAM is close to or above currently free GPU memory.")
+        if free_bytes < estimated_storage * 1.25:
+            errors.append("Not enough free disk space for estimated checkpoints and final model.")
+        elif free_bytes < estimated_storage * 2:
+            warnings.append("Free disk space is close to the estimated training storage need.")
+        if checkpoint_count > 50:
+            warnings.append("Save interval may create many checkpoints. Increase Save every or clean old checkpoints.")
+
+        self.training_log.clear()
+        self.training_log.append("Pre-training checklist")
+        for line in info:
+            self.training_log.append(f"[OK] {line}")
+        for line in warnings:
+            self.training_log.append(f"[WARN] {line}")
+        for line in errors:
+            self.training_log.append(f"[ERROR] {line}")
+
+        if errors:
+            self.project_state.setText("Training blocked")
+            self.train_status.setText("Training: blocked")
+            QMessageBox.warning(self, "Training blocked", "Fix the checklist errors before starting training.")
+            return False
+        if warnings:
+            message = "Training checklist has warnings. Continue anyway?\n\n" + "\n".join(f"- {warning}" for warning in warnings[:8])
+            choice = QMessageBox.question(self, "Training warnings", message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if choice != QMessageBox.Yes:
+                self.project_state.setText("Training cancelled")
+                self.train_status.setText("Training: idle")
+                return False
+        return True
+
     def start_training(self) -> None:
         """Collect training options and start model training."""
 
@@ -3088,6 +2816,10 @@ class MainWindow(QMainWindow):
             head_count=self.n_head.value(),
             layer_count=self.n_layer.value(),
             dropout=self.dropout.value(),
+            attention_type=self._attention_type_value(),
+            kv_head_count=self.kv_head_count.value(),
+            attention_backend=self._attention_backend_value(),
+            attention_window=self.attention_window.value(),
             **self._architecture_style_config(),
         )
         resume_path = Path(self.resume_checkpoint.text()) if self.resume_checkpoint.text().strip() else None
@@ -3097,19 +2829,29 @@ class MainWindow(QMainWindow):
             batch_size=self.batch_size.value(),
             learning_rate=self.learning_rate.value(),
             weight_decay=self.weight_decay.value(),
+            optimizer_name=self._optimizer_value(),
+            scheduler_name=self._scheduler_value(),
+            scheduler_min_lr_ratio=self.min_lr_ratio.value(),
+            polynomial_power=self.polynomial_power.value(),
             gradient_accumulation=self.gradient_accumulation.value(),
             warmup_steps=self.warmup_steps.value(),
             eval_interval=self.eval_interval.value(),
+            max_eval_batches=self.max_eval_batches.value(),
             save_interval=self.save_interval.value(),
+            data_loader_workers=self.data_loader_workers.value(),
             max_grad_norm=self.max_grad_norm.value(),
             device=self.device.currentText(),
             use_amp=self.use_amp.isChecked(),
+            precision=self._precision_value(),
             seed=self.seed.value(),
             resume=self.resume_training.isChecked(),
             resume_from_checkpoint=resume_path if self.resume_training.isChecked() else None,
             require_compatible_resume=self.resume_safety.isChecked(),
         )
-        self.training_log.clear()
+        if not self._run_training_preflight(model_config, training_config):
+            return
+        self._init_telemetry_store(Path(self.model_dir.text()))
+        self.training_log.append("")
         self.training_progress.setValue(0)
         self.training_epoch_metric.setText("Epoch: -")
         self.training_step_metric.setText("Step: -")
@@ -3125,11 +2867,29 @@ class MainWindow(QMainWindow):
         self.stability_chart.clear()
         self.throughput_chart.clear()
         self.memory_chart.clear()
+        self.live_prediction_chart.update_distribution(0, None)
+        self.live_attention_chart.update_heatmap(0, None)
+        self.live_activation_chart.update_histogram(0, None)
+        self.live_gradient_chart.update_flow(self.n_layer.value(), None, 0)
+        self.live_progress.setValue(0)
+        self.live_epoch_metric.setText("Epoch: -")
+        self.live_step_metric.setText("Step: -")
+        self.live_tokens_metric.setText("Tokens/sec: -")
+        self.live_loss_metric.setText("Loss: -")
+        self.live_lr_metric.setText("LR: -")
+        self.live_data_metric.setText("Data: -")
+        self.live_sample_text.setText("Training text: -")
+        self.live_flow.set_state(self.n_layer.value(), self.n_head.value(), 0, None)
+        self._set_meter(self.live_cpu_bar, "CPU", self._system_cpu_value())
+        self._set_meter(self.live_gpu_bar, "GPU memory", None)
+        self._set_meter(self.live_vram_bar, "VRAM reserved", None)
+        self._set_meter(self.live_ram_bar, "System RAM", self._system_ram_value())
+        self.live_worker_status.setText(f"CPU workers: {self.data_loader_workers.value()}")
         self.training_log.append("Training started...")
         self.project_state.setText("Training")
         self.train_status.setText("Training: running")
         self._run_task(
-            train_from_dataset,
+            run_training_job,
             (Path(self.train_data_dir.text()), model_config, training_config),
             self._training_finished,
             self.training_log,
@@ -3149,6 +2909,8 @@ class MainWindow(QMainWindow):
         """
 
         self.training_progress.setValue(100)
+        if hasattr(self, "live_progress"):
+            self.live_progress.setValue(100)
         self.training_log.append(f"Saved model: {result.checkpoint_path}")
         self.training_log.append(f"Final train loss: {result.final_train_loss:.4f}")
         if result.final_val_loss is not None:
@@ -3161,6 +2923,7 @@ class MainWindow(QMainWindow):
         else:
             self.project_state.setText("Training complete")
             self.train_status.setText(f"Training: loss {result.final_train_loss:.4f}")
+        self._append_training_history(result)
         self._clear_button_busy("Start Training")
 
     def run_benchmark(self) -> None:

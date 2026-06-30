@@ -145,15 +145,23 @@ class CausalSelfAttention(nn.Module):
 
         super().__init__()
         self.head_count = config.head_count
+        self.kv_head_count = config.resolved_kv_head_count()
         self.embedding_size = config.embedding_size
         self.position_encoding = config.position_encoding
-        self.c_attn = nn.Linear(config.embedding_size, 3 * config.embedding_size, bias=config.bias)
+        self.attention_backend = config.attention_backend
+        self.attention_window = config.attention_window
+        self.head_size = config.embedding_size // config.head_count
+        self.kv_embedding_size = self.kv_head_count * self.head_size
+        self.c_attn = nn.Linear(
+            config.embedding_size,
+            config.embedding_size + (2 * self.kv_embedding_size),
+            bias=config.bias,
+        )
         self.c_proj = nn.Linear(config.embedding_size, config.embedding_size, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        head_size = config.embedding_size // config.head_count
         self.rotary = (
-            RotaryEmbedding(head_size, config.context_length, config.rope_theta)
+            RotaryEmbedding(self.head_size, config.context_length, config.rope_theta)
             if config.position_encoding == "rope"
             else None
         )
@@ -185,12 +193,11 @@ class CausalSelfAttention(nn.Module):
 
         batch_size, token_count, channel_count = value.size()
         qkv = self.c_attn(value)
-        query, key, val = qkv.split(self.embedding_size, dim=2)
-        head_size = channel_count // self.head_count
+        query, key, val = qkv.split((self.embedding_size, self.kv_embedding_size, self.kv_embedding_size), dim=2)
 
-        key = key.view(batch_size, token_count, self.head_count, head_size).transpose(1, 2)
-        query = query.view(batch_size, token_count, self.head_count, head_size).transpose(1, 2)
-        val = val.view(batch_size, token_count, self.head_count, head_size).transpose(1, 2)
+        key = key.view(batch_size, token_count, self.kv_head_count, self.head_size).transpose(1, 2)
+        query = query.view(batch_size, token_count, self.head_count, self.head_size).transpose(1, 2)
+        val = val.view(batch_size, token_count, self.kv_head_count, self.head_size).transpose(1, 2)
         if self.rotary is not None:
             query, key = self.rotary(query, key, start_pos=start_pos)
 
@@ -202,24 +209,56 @@ class CausalSelfAttention(nn.Module):
                 key = key[:, :, -self.mask.size(-1) :, :]
                 val = val[:, :, -self.mask.size(-1) :, :]
         present = (key, val)
+        expanded_key = self._expand_kv(key)
+        expanded_val = self._expand_kv(val)
 
-        attention = (query @ key.transpose(-2, -1)) * (1.0 / math.sqrt(key.size(-1)))
-        key_count = key.size(-2)
+        key_count = expanded_key.size(-2)
         if past_kv is None:
             mask = self.mask[:, :, :token_count, :key_count]
         else:
             start = max(0, key_count - token_count)
             mask = self.mask[:, :, start : start + token_count, :key_count]
-        attention = attention.masked_fill(mask == 0, float("-inf"))
-        attention = F.softmax(attention, dim=-1)
-        attention = self.attn_dropout(attention)
+        if self.attention_window > 0:
+            positions = torch.arange(key_count, device=value.device)
+            query_positions = torch.arange(key_count - token_count, key_count, device=value.device)
+            window_mask = positions[None, :] >= (query_positions[:, None] - self.attention_window + 1)
+            mask = mask & window_mask.view(1, 1, token_count, key_count)
 
-        y = attention @ val
+        if self.attention_backend == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
+            attn_mask = mask[:, :, :, :].bool()
+            y = F.scaled_dot_product_attention(
+                query,
+                expanded_key,
+                expanded_val,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+            )
+        else:
+            attention = (query @ expanded_key.transpose(-2, -1)) * (1.0 / math.sqrt(expanded_key.size(-1)))
+            attention = attention.masked_fill(mask == 0, float("-inf"))
+            attention = F.softmax(attention, dim=-1)
+            attention = self.attn_dropout(attention)
+            y = attention @ expanded_val
         y = y.transpose(1, 2).contiguous().view(batch_size, token_count, channel_count)
         output = self.resid_dropout(self.c_proj(y))
         if use_cache:
             return output, present
         return output
+
+    def _expand_kv(self, value: torch.Tensor) -> torch.Tensor:
+        """Expand grouped key/value heads to query head count.
+
+        Args:
+            value: Key or value tensor with key/value head count.
+
+        Returns:
+            Tensor with one key/value head per query head.
+        """
+
+        if self.kv_head_count == self.head_count:
+            return value
+        repeat_count = self.head_count // self.kv_head_count
+        return value.repeat_interleave(repeat_count, dim=1)
 
 
 class MLP(nn.Module):

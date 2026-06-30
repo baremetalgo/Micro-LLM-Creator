@@ -9,3 +9,5 @@ pycryptodome
 llama-cpp-python
 markdown
 Pygments
+pyqtgraph
+psutil

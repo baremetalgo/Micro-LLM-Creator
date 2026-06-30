@@ -1,0 +1,6 @@
+The apprentice studied the small machine and wrote careful notes.
+The machine answered slowly, step by step, and checked its own work.
+When the prompt asked for a plan, the model listed the facts first.
+Reasoning improved when examples showed questions, thoughts, and answers.
+Small models need clean text, repeated patterns, and honest evaluation.
+The trainer saved checkpoints, tested prompts, and exported useful artifacts.

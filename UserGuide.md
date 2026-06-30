@@ -47,17 +47,19 @@ The app has five main work areas:
 1. Collect clean training material.
 2. Open `IN`.
 3. Choose the source folder.
-4. Enable Code Training Mode if your data contains programming material.
-5. Prepare the dataset.
-6. Open `AI`.
-7. Choose a model size and training settings.
-8. Start training.
-9. Resume training if interrupted.
-10. Open `X`.
-11. Bundle or quantize the trained model.
-12. Open `Chat`.
-13. Load a GGUF model and test prompts in the chat window.
-14. Use `Save Project` to store paths and settings for the next session.
+4. Click `Check Health` to verify project paths, artifacts, and hardware.
+5. Click `Preview Dataset` to inspect source files and sample extracted text/code.
+6. Enable Code Training Mode if your data contains programming material.
+7. Prepare the dataset.
+8. Open `AI`.
+9. Choose a model size and training settings.
+10. Start training.
+11. Resume training if interrupted.
+12. Open `X`.
+13. Bundle or quantize the trained model.
+14. Open `Chat`.
+15. Load a GGUF model and test prompts in the chat window.
+16. Use `Save Project` to store paths and settings for the next session.
 
 ## 2.1 New, Save, and Open Projects
 
@@ -79,6 +81,31 @@ run folders. The next `Save Project` will ask for a new parent folder.
 - Export and chat settings.
 - Small summaries from existing dataset/model folders when available.
 
+On first save, the app also creates a standard project workspace:
+
+```text
+YourProject/
+  project.json
+  datasets/
+  models/
+  exports/
+  cache/
+  temp/
+```
+
+The app then points these fields at the project folders:
+
+- Dataset Core -> `datasets/`
+- Training Dataset -> `datasets/`
+- Model Output -> `models/`
+- Export Model Core -> `models/`
+- Output Bay -> `exports/`
+- GGUF Output -> `exports/model.gguf`
+
+The `cache/` and `temp/` folders are used as preferred runtime locations for
+libraries that honor Python/PyTorch/Hugging Face cache and temp environment
+variables.
+
 Important:
 
 - The project file stores paths to large assets; it does not duplicate hundreds
@@ -87,6 +114,27 @@ Important:
   to reopen cleanly.
 - Use `Open Project` to restore the app controls from a saved `project.json`.
 - Use `New Project` before creating a separate experiment from scratch.
+
+### Disk Space During Training
+
+Micro LLM Creator writes prepared datasets and checkpoints to the paths shown in
+the app. Check these first when estimating disk use:
+
+- `datasets/`: corpus, tokenizer, token files, extraction cache, versions.
+- `models/`: checkpoints, final model, summaries, lineage.
+- `exports/`: bundles, FP16 checkpoints, GGUF outputs.
+
+Some C drive usage can still happen outside the app:
+
+- Windows `%TEMP%` and Python temporary files.
+- PyTorch/CUDA runtime caches.
+- pip package cache or installed packages.
+- OS page file or memory compression while training.
+- GPU/driver shader/kernel caches.
+
+After a project is saved or opened, the app prefers project-local `cache/` and
+`temp/` folders for common runtime cache/temp variables. Windows and GPU drivers
+may still use system locations for some low-level work.
 
 ## 3. Dataset Preparation
 
@@ -99,7 +147,118 @@ The `IN` tab is organized into:
 - `Source Array`: source folder, dataset folder, parallel workers, and prepare mode.
 - `Tokenizer Core`: vocabulary, tokenizer policy, context, validation, and code options.
 - `Dataset Quality`: sample, token, vocabulary, code/prose, cache, and warning summary.
+- `Dataset Advisor`: visible cleanup suggestions after Preview Dataset.
 - `Ingest Telemetry`: live preparation messages while files are processed.
+
+### Check Health
+
+Runs a project readiness check before long work.
+
+It validates:
+
+- source folder and supported files
+- prepared dataset artifacts
+- trained model/checkpoint artifacts
+- export folder
+- selected GGUF chat model
+- llama.cpp converter path when provided
+- selected training device and CUDA availability
+
+Effect:
+
+- Helps catch missing paths before preparing or training.
+- Warns when a dataset/model/export is not created yet.
+- Reports an error if CUDA is selected but PyTorch cannot use CUDA.
+
+### Preview Dataset
+
+Scans the source folder and prepared dataset state without writing training
+artifacts.
+
+It shows:
+
+- supported source file count
+- source size
+- file type breakdown
+- prepared dataset status
+- likely duplicate files or repeated extracted text
+- suspicious extraction quality
+- code/prose balance
+- training readiness score
+- quality notes
+- a few readable text/code previews
+
+Effect:
+
+- Lets you inspect whether PDFs/text/code are extracting cleanly.
+- Helps catch tiny datasets, unreadable files, and incomplete prepared folders.
+- Helps catch duplicate-heavy datasets before the model memorizes repeated text.
+- Gives a simple readiness signal before you spend training time.
+- Gives confidence before spending time on full dataset preparation.
+
+### Duplicate Detection
+
+Preview Dataset checks for:
+
+- exact duplicate files with identical content
+- repeated extracted text previews
+
+Effect on the LLM:
+
+- Duplicate-heavy datasets make small models memorize repeated passages.
+- Duplicates can make training loss look better while validation/generation
+  quality stays weak.
+- Remove duplicate books, repeated exports, copied folders, and generated files
+  before serious training.
+
+### Bad Extraction Detection
+
+Preview Dataset flags source files with suspicious text extraction.
+
+Examples:
+
+- PDFs that produce almost no readable text.
+- Text with very high symbol/noise ratio.
+- Long repeated character runs.
+- Encoding artifacts.
+- Very low word variety.
+
+Effect on the LLM:
+
+- Bad PDF extraction teaches broken spacing, broken code, and noisy symbols.
+- Noisy files waste model capacity.
+- Remove or replace flagged files, or use cleaner source formats when possible.
+
+### Code/Prose Balance
+
+Preview Dataset reports whether the source looks prose-heavy, code-heavy, or
+balanced.
+
+Effect on the LLM:
+
+- Prose-heavy datasets are better for explanation but weaker for code syntax.
+- Code-heavy datasets are better for syntax but may give terse explanations.
+- Balanced code/prose is usually best for a programming assistant that writes
+  and explains code.
+
+### Training Readiness
+
+Preview Dataset gives a score from `0` to `100` with a label:
+
+- `Ready`
+- `Usable with warnings`
+- `Needs cleanup`
+- `Not ready`
+
+The score considers:
+
+- prepared token count when available
+- source size before preparation
+- duplicate ratio
+- bad extraction ratio
+- code/prose balance for code-training projects
+
+Use the reasons in Ingest Telemetry to decide what to fix before training.
 
 ### Source Vault
 
@@ -447,6 +606,31 @@ Recommendation:
 
 Training uses next-token prediction: the model sees tokens and learns to predict
 the next token.
+
+Before training starts, the app runs a pre-training checklist. It validates the
+prepared dataset, tokenizer, train/validation token files, model architecture,
+selected device, resume checkpoint, estimated checkpoint size, and free disk
+space on the model output drive.
+
+Hard errors block training. Warnings are shown in Training Telemetry and ask for
+confirmation before continuing.
+
+The checklist also shows:
+
+- estimated parameter count
+- estimated checkpoint size
+- rough VRAM estimate
+- estimated total training storage
+- free model-drive space
+- run history count
+
+Every completed or safely stopped training run is appended to
+`models/training_history.json`. The history records checkpoint path, losses,
+dataset path/version, run id, model config, and training config.
+
+The `AI` tab also has a `Model Estimate` card. Click `Refresh Estimate` to
+update parameter count, checkpoint size, rough VRAM, and run-history count
+without starting training.
 
 ### Dataset Project
 
@@ -828,6 +1012,11 @@ print(a + b)
 ## 4.1 Training Metrics and Telemetry
 
 The `AI` tab shows live training telemetry while a run is active.
+
+Training graphs are interactive. They show titles, legends, X/Y axes, grid
+lines, and hover values for nearby plotted points. The X-axis is the optimizer
+step. The Y-axis depends on the graph: loss, optimization value, parameter
+stability value, throughput rate, or GPU memory in GB.
 
 ### ETA
 
