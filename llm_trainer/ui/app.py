@@ -52,6 +52,7 @@ from llm_trainer.evaluation import DEFAULT_BENCHMARK_PROMPTS, evaluate_checkpoin
 from llm_trainer.export import export_gguf_with_llama_cpp, export_hf_microgpt_package, export_project_bundle, quantize_checkpoint
 from llm_trainer.fine_tuning_service import run_fine_tuning_job
 from llm_trainer.llama_chat import LlamaChatSession, load_llama_chat_session, stream_chat_reply
+from llm_trainer.microgpt_chat import load_microgpt_chat_session, stream_microgpt_chat_reply
 from llm_trainer.services import build_dataset, check_project_health, scan_dataset_preview
 from llm_trainer.telemetry_store import initialize_store, insert_metric, latest_run, rows_until, telemetry_db_path
 from llm_trainer.training import check_resume_compatibility, latest_checkpoint
@@ -254,7 +255,7 @@ class MainWindow(QMainWindow):
         self.dataset_status = QLabel("Dataset: not prepared")
         self.train_status = QLabel("Training: idle")
         self.export_status = QLabel("Export: waiting")
-        self.chat_status = QLabel("Chat: no GGUF loaded")
+        self.chat_status = QLabel("Chat: no model loaded")
         for label in (self.dataset_status, self.train_status, self.export_status, self.chat_status):
             label.setObjectName("TopStatus")
             label.setMinimumWidth(0)
@@ -305,7 +306,7 @@ class MainWindow(QMainWindow):
         self._tip(self.jobs_nav, "Open Job Manager: monitor workers, remote connections, assignments, and job controls.")
         self._tip(self.benchmark_nav, "Open benchmark prompts: test checkpoint quality with repeatable prompts.")
         self._tip(self.export_nav, "Open export tools: bundle or quantize the trained model artifacts.")
-        self._tip(self.chat_nav, "Open Chat: load a GGUF model once and send prompts.")
+        self._tip(self.chat_nav, "Open Chat: load a GGUF or native MicroGPT model once and send prompts.")
         self.dataset_nav.setChecked(True)
         self.dataset_nav.clicked.connect(lambda: self._switch_page(0))
         self.training_nav.clicked.connect(lambda: self._switch_page(1))
@@ -922,7 +923,7 @@ class MainWindow(QMainWindow):
         return build_benchmark_tab(self)
 
     def _build_chat_tab(self) -> QWidget:
-        """Build the GGUF model test chat page.
+        """Build the model test chat page.
 
         Returns:
             Chat page widget.
@@ -1308,6 +1309,33 @@ class MainWindow(QMainWindow):
             self.current_assistant_meta.setText(text)
             self.current_assistant_meta.setVisible(True)
 
+    def _chat_backend_value(self) -> str:
+        """Return the selected chat model backend.
+
+        Returns:
+            Stable chat backend identifier.
+        """
+
+        if not hasattr(self, "chat_model_backend"):
+            return "gguf"
+        return "microgpt" if self.chat_model_backend.currentText() == "MicroGPT checkpoint" else "gguf"
+
+    def _update_chat_backend_controls(self) -> None:
+        """Show controls relevant to the selected chat backend."""
+
+        if not hasattr(self, "chat_model_backend"):
+            return
+        native = self._chat_backend_value() == "microgpt"
+        self.gguf_path_row.setVisible(not native)
+        self.microgpt_path_row.setVisible(native)
+        self.llama_gpu_layers.setEnabled(not native)
+        self.llama_threads.setEnabled(not native)
+        self.llama_context.setEnabled(not native)
+        if native:
+            self._tip(self.load_llm_button, "Load the native MicroGPT checkpoint into memory once for repeated chat messages.")
+        else:
+            self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+
     def _lightning_icon(self) -> QIcon:
         """Create the window lightning icon.
 
@@ -1589,6 +1617,7 @@ class MainWindow(QMainWindow):
                 "llama_cpp_dir": "",
                 "gguf_output_path": str(export_dir / "model.gguf"),
                 "gguf_model": "",
+                "microgpt_chat_model": "",
                 "tokenizer_import": "",
                 "resume_checkpoint": "",
                 "fine_tune_checkpoint": "",
@@ -1665,6 +1694,7 @@ class MainWindow(QMainWindow):
                 "gguf_outtype": "f16",
             },
             "chat": {
+                "model_backend": "gguf",
                 "context": 2048,
                 "cpu_threads": 4,
                 "gpu_layers": -1,
@@ -1713,7 +1743,7 @@ class MainWindow(QMainWindow):
         self.dataset_status.setText("Dataset: not prepared")
         self.train_status.setText("Training: idle")
         self.export_status.setText("Export: waiting")
-        self.chat_status.setText("Chat: no GGUF loaded")
+        self.chat_status.setText("Chat: no model loaded")
         self.prepare_button.setText("Prepare Dataset")
         self.train_button.setText("Start Training")
         self.fine_tune_button.setText("Start Fine-Tune")
@@ -1723,7 +1753,7 @@ class MainWindow(QMainWindow):
         self.stop_benchmark_button.setEnabled(False)
         self.stop_chat_button.setEnabled(False)
         self.load_llm_button.setText("Load Model")
-        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+        self._update_chat_backend_controls()
         self._reset_dataset_quality_report()
         self.training_epoch_metric.setText("Epoch: -")
         self.training_step_metric.setText("Step: -")
@@ -1765,7 +1795,7 @@ class MainWindow(QMainWindow):
         self.chat_stream_prefix = ""
         self.chat_stream_reply = ""
         self.chat_stats.setText("Idle")
-        self._add_chat_message("assistant", "Load a GGUF model to start testing.")
+        self._add_chat_message("assistant", "Load a GGUF or MicroGPT model to start testing.")
 
     def _project_state_dict(self, project_name: str, project_dir: Path) -> dict[str, Any]:
         """Collect all UI state that defines a Micro LLM project.
@@ -1797,6 +1827,7 @@ class MainWindow(QMainWindow):
                 "llama_cpp_dir": self.llama_cpp_dir.text(),
                 "gguf_output_path": self.gguf_output_path.text(),
                 "gguf_model": self.gguf_path.text(),
+                "microgpt_chat_model": self.microgpt_chat_path.text(),
                 "tokenizer_import": self.tokenizer_path.text(),
                 "resume_checkpoint": self.resume_checkpoint.text(),
                 "fine_tune_checkpoint": self.fine_tune_checkpoint.text(),
@@ -1876,6 +1907,7 @@ class MainWindow(QMainWindow):
                 "gguf_outtype": self.gguf_outtype.currentText(),
             },
             "chat": {
+                "model_backend": self._chat_backend_value(),
                 "context": self.llama_context.value(),
                 "cpu_threads": self.llama_threads.value(),
                 "gpu_layers": self.llama_gpu_layers.value(),
@@ -1924,6 +1956,7 @@ class MainWindow(QMainWindow):
         self.llama_cpp_dir.setText(str(paths.get("llama_cpp_dir", "")))
         self.gguf_output_path.setText(str(paths.get("gguf_output_path", "")))
         self.gguf_path.setText(str(paths.get("gguf_model", "")))
+        self.microgpt_chat_path.setText(str(paths.get("microgpt_chat_model", "")))
         self.tokenizer_path.setText(str(paths.get("tokenizer_import", "")))
         self.resume_checkpoint.setText(str(paths.get("resume_checkpoint", "")))
         self.fine_tune_checkpoint.setText(str(paths.get("fine_tune_checkpoint", "")))
@@ -2054,6 +2087,10 @@ class MainWindow(QMainWindow):
         self._set_combo_text(self.quant_mode, str(export.get("quantization", self.quant_mode.currentText())))
         self._set_combo_text(self.gguf_outtype, str(export.get("gguf_outtype", self.gguf_outtype.currentText())))
         self.llama_context.setValue(int(chat.get("context", self.llama_context.value())))
+        self._set_combo_by_data(self.chat_model_backend, str(chat.get("model_backend", "gguf")), {
+            "gguf": "GGUF / llama.cpp",
+            "microgpt": "MicroGPT checkpoint",
+        })
         self.llama_threads.setValue(int(chat.get("cpu_threads", self.llama_threads.value())))
         self.llama_gpu_layers.setValue(int(chat.get("gpu_layers", self.llama_gpu_layers.value())))
         self.thinking_enabled.setChecked(bool(chat.get("thinking_enabled", True)))
@@ -4193,7 +4230,7 @@ class MainWindow(QMainWindow):
         self._clear_button_busy("Run Benchmark")
 
     def toggle_llm_model(self) -> None:
-        """Load or unload the GGUF model depending on current state."""
+        """Load or unload the selected chat model depending on current state."""
 
         if self.chat_session is not None:
             self.unload_llm_model()
@@ -4201,20 +4238,29 @@ class MainWindow(QMainWindow):
         self.load_llm_model()
 
     def load_llm_model(self) -> None:
-        """Load a GGUF model for chat testing."""
+        """Load a selected model backend for chat testing."""
 
-        model_path = Path(self.gguf_path.text().strip())
-        if not model_path:
-            QMessageBox.information(self, "Model required", "Choose a GGUF model file first.")
+        backend = self._chat_backend_value()
+        path_text = self.microgpt_chat_path.text().strip() if backend == "microgpt" else self.gguf_path.text().strip()
+        if not path_text:
+            required = "MicroGPT model folder or checkpoint" if backend == "microgpt" else "GGUF model file"
+            QMessageBox.information(self, "Model required", f"Choose a {required} first.")
             return
+        model_path = Path(path_text)
         self.chat_progress.setValue(0)
-        self._render_chat_markdown("**Loading GGUF model...**")
+        self._render_chat_markdown("**Loading model...**")
         self.chat_stats.setText("Loading model...")
-        self.project_state.setText("Loading GGUF")
+        self.project_state.setText("Loading chat model")
         self.chat_status.setText("Chat: loading model")
+        loader = load_microgpt_chat_session if backend == "microgpt" else load_llama_chat_session
+        args = (
+            (model_path, self.device.currentText())
+            if backend == "microgpt"
+            else (model_path, self.llama_context.value(), self.llama_threads.value(), self.llama_gpu_layers.value())
+        )
         self._run_task(
-            load_llama_chat_session,
-            (model_path, self.llama_context.value(), self.llama_threads.value(), self.llama_gpu_layers.value()),
+            loader,
+            args,
             self._llm_loaded,
             self.chat_event_log,
             self.chat_progress,
@@ -4239,13 +4285,13 @@ class MainWindow(QMainWindow):
         )
         self.chat_progress.setValue(100)
         self.chat_stats.setText(session.runtime_summary)
-        self.project_state.setText("GGUF loaded")
+        self.project_state.setText("Chat model loaded")
         self.chat_status.setText(f"Chat: {session.runtime_summary}")
         self._clear_button_busy("Unload")
-        self._tip(self.load_llm_button, "Unload the currently loaded GGUF model from memory.")
+        self._tip(self.load_llm_button, "Unload the currently loaded model from memory.")
 
     def unload_llm_model(self) -> None:
-        """Unload the active GGUF model and clear chat state."""
+        """Unload the active chat model and clear chat state."""
 
         if self.thread is not None:
             QMessageBox.information(self, "Task running", "Please wait for the current task to finish.")
@@ -4255,20 +4301,20 @@ class MainWindow(QMainWindow):
         self.chat_session = None
         self._clear_chat_messages()
         self.chat_markdown = ""
-        self._add_chat_message("assistant", "Model unloaded.\n\nLoad a GGUF model to start testing.")
+        self._add_chat_message("assistant", "Model unloaded.\n\nLoad a model to start testing.")
         self.chat_progress.setRange(0, 100)
         self.chat_progress.setValue(0)
         self.chat_stats.setText("Idle")
         self.project_state.setText("Ready")
-        self.chat_status.setText("Chat: no GGUF loaded")
+        self.chat_status.setText("Chat: no model loaded")
         self.load_llm_button.setText("Load Model")
-        self._tip(self.load_llm_button, "Load the GGUF model into memory once for repeated chat messages.")
+        self._update_chat_backend_controls()
 
     def send_chat_message(self) -> None:
-        """Send a prompt to the loaded GGUF model."""
+        """Send a prompt to the loaded chat model."""
 
         if self.chat_session is None:
-            QMessageBox.information(self, "Load model", "Load a GGUF model before sending a message.")
+            QMessageBox.information(self, "Load model", "Load a model before sending a message.")
             return
         prompt = self.chat_input.toPlainText().strip()
         if not prompt:
@@ -4282,8 +4328,9 @@ class MainWindow(QMainWindow):
         self.chat_stats.setText("Thinking...")
         self.project_state.setText("Generating")
         self.chat_status.setText("Chat: generating reply")
+        streamer = stream_microgpt_chat_reply if self._chat_backend_value() == "microgpt" else stream_chat_reply
         self._run_task(
-            stream_chat_reply,
+            streamer,
             (
                 self.chat_session,
                 prompt,
@@ -4410,14 +4457,33 @@ class MainWindow(QMainWindow):
     def convert_hf_to_gguf(self) -> None:
         """Convert an HF-compatible model folder to GGUF through llama.cpp."""
 
+        model_dir_text = self.export_model_dir.text().strip()
+        llama_dir_text = self.llama_cpp_dir.text().strip()
+        output_text = self.gguf_output_path.text().strip()
+        if not model_dir_text:
+            QMessageBox.warning(self, "GGUF blocked", "Choose the model core folder first.")
+            return
+        if not (Path(model_dir_text) / "hf_model").exists():
+            QMessageBox.warning(
+                self,
+                "GGUF blocked",
+                "GGUF conversion needs an HF model package first. Use Export HF Package, then convert a llama.cpp-supported model.",
+            )
+            return
+        if not llama_dir_text:
+            QMessageBox.warning(self, "GGUF blocked", "Choose your local llama.cpp folder containing convert_hf_to_gguf.py.")
+            return
+        if not output_text:
+            QMessageBox.warning(self, "GGUF blocked", "Choose a GGUF output file path.")
+            return
         self.export_log.append("Starting llama.cpp GGUF conversion...")
         self.export_progress.setValue(0)
         self._run_task(
             export_gguf_with_llama_cpp,
             (
-                Path(self.export_model_dir.text()),
-                Path(self.llama_cpp_dir.text()),
-                Path(self.gguf_output_path.text()),
+                Path(model_dir_text),
+                Path(llama_dir_text),
+                Path(output_text),
                 self.gguf_outtype.currentText(),
             ),
             self._gguf_conversion_finished,

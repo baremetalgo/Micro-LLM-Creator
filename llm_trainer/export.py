@@ -219,6 +219,52 @@ def _hf_readme(config: dict[str, object]) -> str:
     )
 
 
+def find_llama_cpp_converter(llama_cpp_dir: Path) -> Path:
+    """Find the llama.cpp Hugging Face to GGUF converter.
+
+    Args:
+        llama_cpp_dir: llama.cpp checkout folder or direct converter path.
+
+    Returns:
+        Path to the converter script.
+
+    Raises:
+        ExportError: If no converter is found.
+    """
+
+    llama_cpp_dir = Path(llama_cpp_dir)
+    if llama_cpp_dir.is_file() and llama_cpp_dir.name == "convert_hf_to_gguf.py":
+        return llama_cpp_dir
+    if not str(llama_cpp_dir).strip() or str(llama_cpp_dir) == ".":
+        raise ExportError(
+            "Choose your local llama.cpp folder first. It should contain convert_hf_to_gguf.py."
+        )
+    if not llama_cpp_dir.exists():
+        raise ExportError(f"llama.cpp path does not exist: {llama_cpp_dir}")
+    if not llama_cpp_dir.is_dir():
+        raise ExportError(f"llama.cpp path is not a folder: {llama_cpp_dir}")
+
+    candidates = [
+        llama_cpp_dir / "convert_hf_to_gguf.py",
+        llama_cpp_dir / "convert" / "convert_hf_to_gguf.py",
+        llama_cpp_dir / "examples" / "convert_hf_to_gguf.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    matches = sorted(llama_cpp_dir.rglob("convert_hf_to_gguf.py"))
+    if matches:
+        return matches[0]
+
+    searched = "\n".join(f"- {candidate}" for candidate in candidates)
+    raise ExportError(
+        "Could not find llama.cpp converter script.\n"
+        "Expected a recent llama.cpp checkout containing convert_hf_to_gguf.py.\n"
+        f"Searched:\n{searched}"
+    )
+
+
 def export_gguf_with_llama_cpp(project_dir: Path, llama_cpp_dir: Path, output_path: Path, outtype: str = "f16") -> Path:
     """Export a Hugging Face-compatible model through llama.cpp.
 
@@ -234,9 +280,7 @@ def export_gguf_with_llama_cpp(project_dir: Path, llama_cpp_dir: Path, output_pa
     Raises:
         ExportError: If converter or HF model folder is missing.
     """
-    converter = llama_cpp_dir / "convert_hf_to_gguf.py"
-    if not converter.exists():
-        raise ExportError(f"Could not find llama.cpp converter: {converter}")
+    converter = find_llama_cpp_converter(llama_cpp_dir)
 
     hf_dir = project_dir / "hf_model"
     if not hf_dir.exists():
